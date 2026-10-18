@@ -1820,7 +1820,7 @@ test("credential mutation failure leaves the session selection and runtime uncha
   });
   await mock.events.get("session_start")?.[0]?.({}, context.ctx);
   store.updateProvider = async () => {
-    throw new Error("credential disk unavailable");
+    throw new Error("credential disk unavailable: private-refresh\u001b[31m");
   };
   const removeContext = createInteractiveAccountContext(
     {
@@ -1829,10 +1829,12 @@ test("credential mutation failure leaves the session selection and runtime uncha
       sessionManager,
     },
     { selections: ["Remove account", "Anthropic · work"], confirms: [true] },
-  ).ctx;
-  await mock.commands.get("accounts")?.handler("ignored", removeContext);
+  );
+  await mock.commands.get("accounts")?.handler("ignored", removeContext.ctx);
   assert.equal(keys.get("anthropic"), "access-work");
   assert.equal(latestSessionSelections(sessionManager).anthropic, "work");
+  assert.match(removeContext.notifications.at(-1)?.message ?? "", /Could not remove the account/);
+  assert.doesNotMatch(JSON.stringify(removeContext.notifications), /private-refresh/);
 });
 
 test("a removed session-selected credential fails closed until explicit recovery", async () => {

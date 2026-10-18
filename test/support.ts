@@ -230,7 +230,7 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     const harness = createCustomSelectorHarness(factory, 100);
     const options: string[] = [];
     for (let index = 0; index < 200; index += 1) {
-      const selected = selectedKitRow(harness.render());
+      const selected = selectedRow(harness.render());
       if (!selected || options.includes(selected)) break;
       options.push(selected);
       harness.handleInput("tui.select.down");
@@ -284,16 +284,8 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     harness.handleInput("tui.select.cancel");
     return harness.result;
   };
-  const customOverride = overrides.custom as ((factory: unknown, options?: unknown) => Promise<unknown>) | undefined;
   const custom =
-    customOverride && selectOverride
-      ? async (factory: unknown, options?: unknown) => {
-          const probe = createCustomSelectorHarness(factory, 100);
-          const standard = probe.isPiTuiKitScreen;
-          probe.dispose();
-          return standard ? defaultCustom(factory) : customOverride(factory, options);
-        }
-      : (customOverride ?? defaultCustom);
+    (overrides.custom as ((factory: unknown, options?: unknown) => Promise<unknown>) | undefined) ?? defaultCustom;
 
   const ctx = {
     cwd: overrides.cwd ?? process.cwd(),
@@ -374,7 +366,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function selectedKitRow(lines: readonly string[]): string | undefined {
+function selectedRow(lines: readonly string[]): string | undefined {
   const line = lines.find((candidate) => candidate.startsWith("→ ") || candidate.startsWith("› "));
   if (!line) return undefined;
   return line
@@ -478,9 +470,6 @@ export function createCustomSelectorHarness(
       (component as { dispose?: () => void }).dispose?.();
     },
     resultPromise,
-    get isPiTuiKitScreen() {
-      return (component as { __piTuiKitScreen?: true }).__piTuiKitScreen === true;
-    },
     get isFocusable() {
       return "focused" in component;
     },

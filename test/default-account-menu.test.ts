@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
-import { initTheme } from "@earendil-works/pi-coding-agent";
-import { beforeAll, test } from "vitest";
+import { test } from "vitest";
 import { showAccountsMenu } from "../src/account-menu.js";
 import { AccountStore, InMemoryAccountStorageBackend } from "../src/account-store.js";
 import { createBuiltinProviderAdapters } from "../src/oauth.js";
-import { createCustomSelectorHarness, createMockContext } from "./support.js";
-
-beforeAll(() => initTheme("dark", false));
+import { createMockContext } from "./support.js";
 
 const credential = {
   type: "oauth" as const,
@@ -36,6 +33,110 @@ async function setup() {
   const controller = new AbortController();
   const owner = { signal: controller.signal, isCurrent: () => !controller.signal.aborted };
   return { store, controller, owner };
+}
+
+for (const mode of ["tui", "rpc"] as const) {
+  for (const result of ["switch", "removed", "shutdown"] as const) {
+    test(`${mode} native account switch revalidates ${result} after selection`, async () => {
+      const { store, owner, controller } = await setup();
+      const choices = ["Switch Anthropic account", "beta"];
+      const switched: string[] = [];
+      const { ctx } = createMockContext({
+        mode,
+        hasUI: true,
+        model: { provider: "anthropic", id: "claude" },
+        select: async (_title: string, options: string[], dialog?: { signal?: AbortSignal }) => {
+          assert.equal(dialog?.signal, owner.signal);
+          const choice = choices.shift();
+          if (choice === "beta") {
+            assert.deepEqual(options, ["beta", "default"]);
+            if (result === "removed") {
+              await store.updateProvider("anthropic", (state) => ({ ...state, accounts: { alpha: credential } }));
+            }
+            if (result === "shutdown") controller.abort();
+          }
+          return choice;
+        },
+      });
+      await showAccountsMenu(
+        ctx,
+        store,
+        adapters,
+        { selections: { anthropic: "alpha" } },
+        {
+          ...handlers,
+          async switch(adapter, name, signal, isCurrent) {
+            assert.equal(adapter.id, "anthropic");
+            assert.equal(signal, owner.signal);
+            assert.equal(isCurrent(), true);
+            switched.push(name);
+          },
+        },
+        owner,
+      );
+      assert.deepEqual(switched, result === "switch" ? ["beta"] : []);
+      assert.equal(store.read().providers.anthropic?.active, "alpha");
+    });
+  }
+
+  test(`${mode} removal confirmation is cancelled with its menu owner`, async () => {
+    const { store, owner, controller } = await setup();
+    const before = store.read();
+    const choices = ["Remove account", "Anthropic · beta"];
+    const { ctx } = createMockContext({
+      mode,
+      hasUI: true,
+      select: async () => choices.shift(),
+      confirm: async (_title: string, _message: string, dialog?: { signal?: AbortSignal }) => {
+        assert.equal(dialog?.signal, owner.signal);
+        controller.abort();
+        return true;
+      },
+    });
+    await showAccountsMenu(ctx, store, adapters, { selections: { anthropic: "alpha" } }, handlers, owner);
+    assert.equal(choices.length, 0);
+    assert.deepEqual(store.read(), before);
+  });
+}
+
+for (const controls of [
+  "\u001b[31m",
+  "\u001b]52;c;payload\u0007",
+  "\u001bPpayload\u001b\\",
+  "\u009b31m\u009d",
+  "\u202e\u2066\u200f\r\n\t",
+]) {
+  test(`native menu strips terminal and direction controls ${JSON.stringify(controls)}`, async () => {
+    const { store, owner } = await setup();
+    let title = "";
+    const { ctx } = createMockContext({
+      mode: "rpc",
+      hasUI: true,
+      model: { provider: `google${controls}`, id: `gemini${controls}` },
+      select: async (value: string) => {
+        title = value;
+        return undefined;
+      },
+    });
+    await showAccountsMenu(
+      ctx,
+      store,
+      adapters,
+      {
+        selections: { anthropic: "alpha" },
+        error: `Recover${controls}`,
+      },
+      handlers,
+      owner,
+    );
+    assert.match(title, /Current model:/);
+    for (const character of title) {
+      const code = character.codePointAt(0) ?? 0;
+      assert.ok(code >= 32 || character === "\n");
+      assert.ok(code < 127 || code > 159);
+    }
+    for (const control of ["\u202e", "\u2066", "\u200f"]) assert.equal(title.includes(control), false);
+  });
 }
 
 for (const cancelAt of [1, 2]) {
@@ -92,59 +193,44 @@ for (const failure of ["removed", "write", "shutdown"] as const) {
   });
 }
 
-for (const finish of ["save", "cancel", "dispose", "shutdown"] as const) {
-  test(`TUI default picker supports ${finish} with injected non-default keybindings`, async () => {
-    const { store, owner, controller } = await setup();
-    const renders: string[] = [];
-    let screen = 0;
-    const { ctx, notifications } = createMockContext({
-      mode: "tui",
-      hasUI: true,
-      custom: async (factory: unknown) => {
-        const bindings: Record<string, string> = {
-          "tui.select.down": "j",
-          "tui.select.up": "k",
-          "tui.select.confirm": "!",
-          "tui.select.cancel": "q",
-        };
-        const harness = createCustomSelectorHarness(factory, 100, {
-          matches: (data, key) => bindings[key] === data,
-          getKeys: (key) => (bindings[key] ? [bindings[key]] : []),
-        });
-        try {
-          renders.push(harness.render().join("\n"));
-          if (screen === 0) {
-            // Unsupported current model: login, switch, remove, add API key, set default.
-            for (let i = 0; i < 4; i++) harness.handleInput("j");
-          } else if (screen === 2) {
-            if (finish === "cancel") harness.handleInput("\u0003");
-            else if (finish === "dispose") {
-              harness.dispose();
-              return undefined;
-            } else if (finish === "shutdown") controller.abort();
-            else {
-              // Pi login, disabled alpha, beta.
-              harness.handleInput("j");
-              harness.handleInput("j");
-            }
+for (const mode of ["tui", "rpc"] as const) {
+  for (const finish of ["save", "cancel", "shutdown", "stale"] as const) {
+    test(`${mode} default picker delegates ${finish} to native cancellable dialogs`, async () => {
+      const { store, owner, controller } = await setup();
+      const titles: string[] = [];
+      const choices = ["Set default account", "Anthropic", "beta"];
+      const { ctx, notifications } = createMockContext({
+        mode,
+        hasUI: true,
+        custom: async () => {
+          throw new Error("Account menus must use native dialogs");
+        },
+        select: async (title: string, options: string[], dialog?: { signal?: AbortSignal }) => {
+          titles.push(title);
+          assert.equal(dialog?.signal, owner.signal);
+          const choice = choices.shift();
+          if (choice === "beta") {
+            assert.deepEqual(options, ["Pi built-in login", "beta"]);
+            if (finish === "cancel") return undefined;
+            if (finish === "shutdown") controller.abort();
+            if (finish === "stale") owner.isCurrent = () => false;
           }
-          screen++;
-          if (harness.result === undefined) harness.handleInput("!");
-          return await harness.resultPromise;
-        } finally {
-          harness.dispose();
-        }
-      },
+          return choice;
+        },
+      });
+      await showAccountsMenu(ctx, store, adapters, { selections: { anthropic: "alpha" } }, handlers, owner);
+      assert.match(titles[2] ?? "", /Default Anthropic account/);
+      assert.match(titles[2] ?? "", /Saved default: alpha/);
+      assert.equal(titles.join("\n").includes("secret-access"), false);
+      assert.equal(store.read().providers.anthropic?.active, finish === "save" ? "beta" : "alpha");
+      assert.equal(
+        notifications.some((notice) => notice.level === "error"),
+        false,
+      );
+      if (finish === "cancel") {
+        assert.match(titles[3] ?? "", /Default accounts for new sessions/);
+        assert.match(titles[4] ?? "", /^Accounts/);
+      }
     });
-    await showAccountsMenu(ctx, store, adapters, { selections: { anthropic: "alpha" } }, handlers, owner);
-    assert.equal(screen, finish === "dispose" ? 2 : 3);
-    assert.match(renders[2] ?? "", /Default Anthropic account/);
-    assert.match(renders[2] ?? "", /Saved default: alpha/);
-    assert.equal(renders.join("\n").includes("secret-access"), false);
-    assert.equal(store.read().providers.anthropic?.active, finish === "save" ? "beta" : "alpha");
-    assert.equal(
-      notifications.some((notice) => notice.level === "error"),
-      false,
-    );
-  });
+  }
 }

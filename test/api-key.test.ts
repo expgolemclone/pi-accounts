@@ -204,7 +204,10 @@ test("RPC API key manager adds, confirms replacement, removes, and cancels witho
       sessionManager,
       model,
       modelRegistry: registry,
-      select: async (_title: string, options: string[]) => {
+      select: async (title: string, options: string[]) => {
+        if (title.startsWith("Default accounts for new sessions")) {
+          assert.deepEqual(options, ["OpenAI Codex"]);
+        }
         const choice = choices.shift();
         if (choice) assert.ok(options.includes(choice), `Missing ${choice}`);
         if (addingKey && choice === "OpenAI") assert.equal(options.includes("OpenAI Codex"), false);
@@ -233,8 +236,9 @@ test("RPC API key manager adds, confirms replacement, removes, and cancels witho
   assert.equal(await registry.getApiKeyForProvider("openai"), "sk-replacement");
   await run(["Add API key account", "OpenAI"], ["invalid", "sk-fixture\n"]);
   assert.equal(store.read().providers.openai?.accounts.invalid, undefined);
-  await run(["Set default account", "OpenAI", "api"], []);
-  assert.equal(store.read().providers.openai?.active, "api");
+  const beforeDefaults = store.read();
+  await run(["Set default account"], []);
+  assert.deepEqual(store.read(), beforeDefaults);
   await run(["Add API key account", "OpenAI"], ["cancelled", undefined]);
   assert.equal(store.read().providers.openai?.accounts.cancelled, undefined);
   await run(["Remove account", "OpenAI · api"], []);

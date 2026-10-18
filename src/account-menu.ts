@@ -1,11 +1,13 @@
+import { stripVTControlCharacters } from "node:util";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { sanitizeTerminalText } from "@narumitw/pi-tui-kit/terminal-text";
 import { type AccountStore, defineOwnMap, getOwnCredential, type StoredCredential } from "./account-store.js";
 import { type AccountProviderAdapter, type AccountProviderId, SUPPORTED_PROVIDER_IDS } from "./oauth.js";
 import type { ProviderAccountSelections } from "./session-selection.js";
 import { readSharedSelection } from "./shared-selection.js";
 
 const LOGIN_ACTION = "Login new account";
+const API_KEY_ACTION = "Add API key account";
+const DEFAULT_ACTION = "Set default account";
 const REMOVE_ACTION = "Remove account";
 const SWITCH_PROVIDER_ACTION = "Switch provider account";
 const SWITCH_ANOTHER_PROVIDER_ACTION = "Switch another provider’s account";
@@ -55,309 +57,180 @@ export async function showAccountsMenu(
     ctx.ui.notify("/accounts requires interactive UI (TUI or RPC mode).", "error");
     return;
   }
-  const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
-  if (!owner.isCurrent()) return;
-  let selectedProviderId: AccountProviderId | undefined;
-  let loginMethod: "oauth" | "api_key" = "oauth";
-  type State = {
-    states: Map<AccountProviderId, ProviderMenuState>;
-    currentProviderId: AccountProviderId | undefined;
-    hasAnyStoredAccount: boolean;
-    selectionError?: string;
-  };
-  type Screen =
-    | "main"
-    | "login-providers"
-    | "switch-providers"
-    | "switch-accounts"
-    | "default-providers"
-    | "default-accounts"
-    | "remove";
-  type Action =
-    | "default-route"
-    | "default-provider"
-    | "default-account"
-    | "login-route"
-    | "api-key-route"
-    | "login-provider"
-    | "switch-current"
-    | "switch-route"
-    | "switch-provider"
-    | "switch-account"
-    | "remove-route"
-    | "remove-account";
-  const menu = defineMenu<State, Screen, Action, ExtensionCommandContext>({
-    start: "main",
-    screens: {
-      main: ({ state }) => {
-        const currentState = state.currentProviderId ? state.states.get(state.currentProviderId) : undefined;
-        return {
-          kind: "actions",
-          title: "Accounts",
-          lines: formatAccountsMenuTitle(
-            ctx,
-            state.states,
-            state.hasAnyStoredAccount,
-            state.selectionError,
-            session.environmentAccount !== undefined || session.environmentError !== undefined,
-          )
-            .split("\n")
-            .slice(1),
-          items: [
-            ...buildAccountMainItems(
-              state.states,
-              currentState,
-              state.hasAnyStoredAccount,
-              state.selectionError !== undefined,
-            ).filter((item) =>
-              session.environmentAccount === undefined && !session.environmentError
-                ? true
-                : item.action !== "switch-current" && item.action !== "switch-route",
-            ),
-            ...([...state.states.values()].some((provider) => provider.adapter.supportsApiKey)
-              ? [
-                  {
-                    id: "api-key",
-                    label: "Add API key account",
-                    action: "api-key-route" as const,
-                  },
-                ]
-              : []),
-            {
-              id: "default",
-              label: "Set default account",
-              description: "Other providers only; OpenAI uses one shared selection",
-              action: "default-route",
-            },
-          ],
-          hint: "close",
-        };
-      },
-      "login-providers": ({ state }) => ({
-        kind: "actions",
-        title: "Select provider",
-        items: sortedProviderStates(state.states)
-          .filter((provider) => loginMethod === "oauth" || provider.adapter.supportsApiKey)
-          .map((provider) => ({
-            id: provider.id,
-            label: provider.adapter.displayName,
-            action: "login-provider",
-          })),
-        hint: "back",
-      }),
-      "switch-providers": ({ state }) => ({
-        kind: "actions",
-        title: "Select provider",
-        items: providerStatesWithAccounts(
-          state.states,
-          state.currentProviderId,
-          state.selectionError !== undefined,
-        ).map((provider) => ({
-          id: provider.id,
-          label: provider.adapter.displayName,
-          action: "switch-provider",
-        })),
-        hint: "back",
-      }),
-      "switch-accounts": ({ state }) => {
-        const provider = selectedProviderId ? state.states.get(selectedProviderId) : undefined;
-        const options = provider
-          ? switchAccountOptions(provider.active, Object.keys(provider.accounts), provider.selectionInvalid)
-          : [];
-        return {
-          kind: "actions",
-          title: provider ? `Switch ${provider.adapter.displayName} account` : "Switch account",
-          items: options.map((option) => {
-            const accountName = stripActiveMarker(option);
-            return {
-              id: accountItemId(accountName),
-              label: option,
-              action: "switch-account" as const,
-              disabled: !provider?.selectionInvalid && accountName === (provider?.active ?? "default"),
-            };
-          }),
-          hint: "back",
-        };
-      },
-      // One scoped preference uses the existing action picker rather than a separate Settings
-      // manager; current-session status stays in the main summary. No custom key handling.
-      "default-providers": ({ state }) => ({
-        kind: "actions",
-        title: "Default accounts for new sessions",
-        lines: ["User-wide settings. Existing sessions keep their own accounts."],
-        items: sortedProviderStates(state.states)
-          .filter((provider) => provider.id !== "openai")
-          .map((provider) => ({
-            id: provider.id,
-            label: provider.adapter.displayName,
-            description: `Default: ${provider.defaultAccount ?? "Pi built-in login"}`,
-            action: "default-provider",
-          })),
-        hint: "back",
-      }),
-      "default-accounts": ({ state }) => {
-        const provider = selectedProviderId ? state.states.get(selectedProviderId) : undefined;
-        return {
-          kind: "actions",
-          title: `Default ${provider?.adapter.displayName ?? "provider"} account`,
-          lines: [
-            `Saved default: ${provider?.defaultAccount ?? "Pi built-in login"}`,
-            "Applies to new sessions only. Selecting an account saves immediately.",
-          ],
-          items: provider
-            ? [
-                {
-                  id: "pi-login",
-                  label: "Pi built-in login",
-                  action: "default-account" as const,
-                  disabled: provider.defaultAccount === undefined,
-                },
-                ...accountNames(provider).map((name) => ({
-                  id: accountItemId(name),
-                  label: name,
-                  action: "default-account" as const,
-                  disabled: name === provider.defaultAccount,
-                })),
-              ]
-            : [],
-          hint: "back",
-        };
-      },
-      remove: ({ state }) => ({
-        kind: "actions",
-        title: "Remove account",
-        items: removeAccountOptions(state.states, state.currentProviderId).map((option) => ({
-          id: removeAccountItemId(option.adapter.id, option.accountName),
-          label: option.label,
-          action: "remove-account",
-        })),
-        hint: "back",
-      }),
-    },
-    actions: {
-      "default-route": async () => ({ kind: "to", screen: "default-providers" }),
-      "default-provider": async ({ itemId }) => {
-        if (!isAccountProviderId(itemId) || itemId === "openai") return { kind: "rejected" };
-        selectedProviderId = itemId;
-        return { kind: "to", screen: "default-accounts" };
-      },
-      "default-account": async ({ itemId, signal }) => {
-        const providerId = selectedProviderId;
-        if (!providerId) return { kind: "rejected" };
-        const isCurrent = () => owner.isCurrent() && !signal.aborted;
-        if (!isCurrent()) return { kind: "close" };
+  const isCurrent = () => owner.isCurrent() && !owner.signal.aborted;
+  const fromEnvironment = session.environmentAccount !== undefined || session.environmentError !== undefined;
+  const readStates = () => readProviderMenuStates(store, adapters, session);
+
+  async function select(title: string, options: string[]): Promise<string | undefined> {
+    if (!isCurrent()) return undefined;
+    const choice = await ctx.ui.select(title, options, { signal: owner.signal });
+    return isCurrent() && choice !== undefined && options.includes(choice) ? choice : undefined;
+  }
+
+  async function selectProvider(title: string, providers: ProviderMenuState[]): Promise<ProviderMenuState | undefined> {
+    const choice = await select(
+      title,
+      providers.map((provider) => provider.adapter.displayName),
+    );
+    return providers.find((provider) => provider.adapter.displayName === choice);
+  }
+
+  async function switchAccount(providerId: AccountProviderId): Promise<boolean> {
+    while (isCurrent()) {
+      const provider = (await readStates()).get(providerId);
+      if (!provider || !isCurrent()) return true;
+      const name = await select(
+        `Switch ${provider.adapter.displayName} account\nCurrent account: ${provider.active ?? "default"}`,
+        switchAccountOptions(provider.active, accountNames(provider), provider.selectionInvalid),
+      );
+      if (!isCurrent()) return true;
+      if (name === undefined) return false;
+      if (fromEnvironment) {
+        ctx.ui.notify(
+          "PI_ACCOUNT controls this process's account selection. Unset it and restart Pi to switch accounts.",
+          "warning",
+        );
+        return false;
+      }
+      const latest = await store.readProviderAsync(providerId);
+      if (!isCurrent()) return true;
+      if (name !== "default" && !getOwnCredential(latest.accounts, name)) continue;
+      await handlers.switch(provider.adapter, name, owner.signal, isCurrent);
+      return true;
+    }
+    return true;
+  }
+
+  async function setDefault(): Promise<boolean> {
+    while (isCurrent()) {
+      const providers = sortedProviderStates(await readStates()).filter((provider) => provider.id !== "openai");
+      const provider = await selectProvider(
+        "Default accounts for new sessions\nUser-wide settings. Existing sessions keep their own accounts.",
+        providers,
+      );
+      if (!provider) return false;
+      while (isCurrent()) {
+        const latest = (await readStates()).get(provider.id);
+        if (!latest || !isCurrent()) return true;
+        const options = [
+          ...(latest.defaultAccount === undefined ? [] : ["Pi built-in login"]),
+          ...accountNames(latest).filter((name) => name !== latest.defaultAccount),
+        ];
+        const choice = await select(
+          `Default ${provider.adapter.displayName} account\nSaved default: ${latest.defaultAccount ?? "Pi built-in login"}\nApplies to new sessions only. Selecting an account saves immediately.`,
+          options,
+        );
+        if (!isCurrent()) return true;
+        if (choice === undefined) break;
+        const name = choice === "Pi built-in login" ? undefined : choice;
         try {
-          const saved = await store.updateProvider(providerId, (state) => {
+          const saved = await store.updateProvider(provider.id, (state) => {
             if (!isCurrent()) throw new DOMException("Menu closed", "AbortError");
-            const name = Object.keys(state.accounts).find((name) => accountItemId(name) === itemId);
-            if (itemId !== "pi-login" && !name) throw new Error("Account no longer exists");
-            return { ...state, active: itemId === "pi-login" ? undefined : name };
+            if (name !== undefined && !getOwnCredential(state.accounts, name))
+              throw new Error("Account no longer exists");
+            return { ...state, active: name };
           });
-          if (!isCurrent()) return { kind: "close" };
-          ctx.ui.notify(
-            `Default ${requireAdapter(adapters, providerId).displayName} account for new sessions: ${saved.active ?? "Pi built-in login"}. This session is unchanged.`,
-            "info",
-          );
-          return { kind: "close" };
+          if (isCurrent()) {
+            ctx.ui.notify(
+              `Default ${provider.adapter.displayName} account for new sessions: ${saved.active ?? "Pi built-in login"}. This session is unchanged.`,
+              "info",
+            );
+          }
+          return true;
         } catch {
-          if (!isCurrent()) return { kind: "close" };
+          if (!isCurrent()) return true;
           ctx.ui.notify("Could not save the default account. Check account storage and try again.", "error");
-          return { kind: "rejected" };
         }
-      },
-      "login-route": async () => {
-        loginMethod = "oauth";
-        return { kind: "to", screen: "login-providers" };
-      },
-      "api-key-route": async () => {
-        loginMethod = "api_key";
-        return { kind: "to", screen: "login-providers" };
-      },
-      "login-provider": async ({ itemId, signal }) => {
-        if (!isAccountProviderId(itemId)) return { kind: "rejected" };
-        const adapter = requireAdapter(adapters, itemId);
-        const name = await ctx.ui.input(`Name this ${adapter.displayName} account:`, "work", {
-          signal,
-        });
-        if (name === undefined || !owner.isCurrent() || signal.aborted) return { kind: "close" };
-        await handlers.login(adapter, name, signal, () => owner.isCurrent() && !signal.aborted, loginMethod);
-        return { kind: "close" };
-      },
-      "switch-current": async ({ itemId }) => {
-        if (!isAccountProviderId(itemId)) return { kind: "rejected" };
-        selectedProviderId = itemId;
-        return { kind: "to", screen: "switch-accounts" };
-      },
-      "switch-route": async () => ({ kind: "to", screen: "switch-providers" }),
-      "switch-provider": async ({ itemId }) => {
-        if (!isAccountProviderId(itemId)) return { kind: "rejected" };
-        selectedProviderId = itemId;
-        return { kind: "to", screen: "switch-accounts" };
-      },
-      "switch-account": async ({ itemId, signal }) => {
-        const providerId = selectedProviderId;
-        if (!providerId) return { kind: "rejected" };
-        if (session.environmentAccount !== undefined || session.environmentError) {
-          ctx.ui.notify(
-            "PI_ACCOUNT controls this process's account selection. Unset it and restart Pi to switch accounts.",
-            "warning",
-          );
-          return { kind: "rejected" };
-        }
-        const latest = await store.readProviderAsync(providerId);
-        if (!owner.isCurrent()) return { kind: "close" };
-        const accountName = switchAccountOptions(
-          session.selections[providerId] ?? undefined,
-          Object.keys(latest.accounts),
-          session.error !== undefined,
-        )
-          .map(stripActiveMarker)
-          .find((name) => accountItemId(name) === itemId);
-        if (!accountName) return { kind: "rejected" };
-        await handlers.switch(requireAdapter(adapters, providerId), accountName, signal, owner.isCurrent);
-        return { kind: "close" };
-      },
-      "remove-route": async () => ({ kind: "to", screen: "remove" }),
-      "remove-account": async ({ itemId, signal }) => {
-        const states = await readProviderMenuStates(store, adapters, session);
-        if (!owner.isCurrent()) return { kind: "close" };
-        const option = removeAccountOptions(states, toProviderId(ctx.model?.provider)).find(
-          (candidate) => removeAccountItemId(candidate.adapter.id, candidate.accountName) === itemId,
+      }
+    }
+    return true;
+  }
+
+  async function removeAccount(): Promise<boolean> {
+    while (isCurrent()) {
+      const options = removeAccountOptions(await readStates(), toProviderId(ctx.model?.provider));
+      const choice = await select(
+        "Remove account",
+        options.map((option) => option.label),
+      );
+      if (!isCurrent()) return true;
+      const option = options.find((option) => option.label === choice);
+      if (!option) return false;
+      const latest = await store.readProviderAsync(option.adapter.id);
+      if (!isCurrent()) return true;
+      if (!getOwnCredential(latest.accounts, option.accountName)) continue;
+      const confirmed = await ctx.ui.confirm(
+        "Remove account",
+        `Remove ${option.adapter.displayName} account "${option.accountName}"?`,
+        { signal: owner.signal },
+      );
+      if (confirmed && isCurrent()) {
+        await handlers.remove(option.adapter, option.accountName, owner.signal, isCurrent);
+      }
+      return true;
+    }
+    return true;
+  }
+
+  while (isCurrent()) {
+    const states = await readStates();
+    if (!isCurrent()) return;
+    const currentProviderId = toProviderId(ctx.model?.provider);
+    const currentState = currentProviderId ? states.get(currentProviderId) : undefined;
+    const hasAnyStoredAccount = [...states.values()].some((state) => accountNames(state).length > 0);
+    const selectionError =
+      (session.environmentAccount !== undefined && session.error
+        ? "The saved session selection is unavailable, but PI_ACCOUNT remains effective. Unset it and restart Pi to repair via /accounts."
+        : session.error) ??
+      session.environmentError ??
+      ([...states.values()].some((state) => state.selectionInvalid)
+        ? session.environmentAccount !== undefined
+          ? "PI_ACCOUNT names an account that is unavailable for at least one provider. Save it or unset PI_ACCOUNT and restart Pi."
+          : "A selected account is no longer available. Choose an account or default to recover."
+        : undefined);
+    const options = [
+      ...mainOptions(states, currentState, hasAnyStoredAccount, selectionError !== undefined).filter(
+        (option) => !fromEnvironment || option === LOGIN_ACTION || option === REMOVE_ACTION,
+      ),
+      ...([...states.values()].some((provider) => provider.adapter.supportsApiKey) ? [API_KEY_ACTION] : []),
+      DEFAULT_ACTION,
+    ];
+    const choice = await select(
+      formatAccountsMenuTitle(ctx, states, hasAnyStoredAccount, selectionError, fromEnvironment),
+      options,
+    );
+    if (choice === undefined) return;
+    if (choice === DEFAULT_ACTION) {
+      if (await setDefault()) return;
+    } else if (choice === REMOVE_ACTION) {
+      if (await removeAccount()) return;
+    } else if (choice === LOGIN_ACTION || choice === API_KEY_ACTION) {
+      const method = choice === API_KEY_ACTION ? "api_key" : "oauth";
+      const provider = await selectProvider(
+        "Select provider",
+        sortedProviderStates(states).filter((provider) => method === "oauth" || provider.adapter.supportsApiKey),
+      );
+      if (!isCurrent()) return;
+      if (!provider) continue;
+      const name = await ctx.ui.input(`Name this ${provider.adapter.displayName} account:`, "work", {
+        signal: owner.signal,
+      });
+      if (name !== undefined && isCurrent())
+        await handlers.login(provider.adapter, name, owner.signal, isCurrent, method);
+      return;
+    } else if (currentState && choice === switchCurrentProviderAction(currentState.adapter)) {
+      if (await switchAccount(currentState.id)) return;
+    } else {
+      while (isCurrent()) {
+        const provider = await selectProvider(
+          "Select provider",
+          providerStatesWithAccounts(await readStates(), currentProviderId, selectionError !== undefined),
         );
-        if (!option) return { kind: "rejected" };
-        const confirmed = await ctx.ui.confirm(
-          "Remove account",
-          `Remove ${option.adapter.displayName} account "${option.accountName}"?`,
-        );
-        if (!confirmed || !owner.isCurrent()) return { kind: "close" };
-        await handlers.remove(option.adapter, option.accountName, signal, owner.isCurrent);
-        return { kind: "close" };
-      },
-    },
-  });
-  await runMenu(ctx, menu, {
-    getState: async () => {
-      const states = await readProviderMenuStates(store, adapters, session);
-      const missingSelection = [...states.values()].some((state) => state.selectionInvalid);
-      return {
-        states,
-        currentProviderId: toProviderId(ctx.model?.provider),
-        hasAnyStoredAccount: [...states.values()].some((state) => accountNames(state).length > 0),
-        selectionError:
-          (session.environmentAccount !== undefined && session.error
-            ? "The saved session selection is unavailable, but PI_ACCOUNT remains effective. Unset it and restart Pi to repair via /accounts."
-            : session.error) ??
-          session.environmentError ??
-          (missingSelection
-            ? session.environmentAccount !== undefined
-              ? "PI_ACCOUNT names an account that is unavailable for at least one provider. Save it or unset PI_ACCOUNT and restart Pi."
-              : "A selected account is no longer available. Choose an account or default to recover."
-            : undefined),
-      };
-    },
-    signal: owner.signal,
-    isCurrent: owner.isCurrent,
-  });
+        if (!provider) break;
+        if (await switchAccount(provider.id)) return;
+      }
+    }
+  }
 }
 
 async function readProviderMenuStates(
@@ -367,7 +240,7 @@ async function readProviderMenuStates(
 ): Promise<Map<AccountProviderId, ProviderMenuState>> {
   const data = await store.readAsync();
   const states = new Map<AccountProviderId, ProviderMenuState>();
-  for (const id of adapters.keys()) {
+  for (const [id, adapter] of adapters) {
     const state = data.providers[id] ?? { accounts: defineOwnMap({}) };
     const active =
       id === "openai"
@@ -375,7 +248,7 @@ async function readProviderMenuStates(
         : (session.environmentAccount ?? session.selections[id] ?? undefined);
     states.set(id, {
       id,
-      adapter: requireAdapter(adapters, id),
+      adapter,
       active,
       defaultAccount: state.active,
       selectionInvalid:
@@ -398,98 +271,64 @@ function formatAccountsMenuTitle(
   if (!hasAnyStoredAccount && !selectionError && !fromEnvironment) {
     return "Accounts\n\nNo saved accounts yet.\n\nWhat do you want to do?";
   }
-  const activeLines = sortedProviderStates(states).map(
-    (state) =>
-      `  ${state.adapter.displayName}: ${state.selectionInvalid ? "recovery required" : fromEnvironment ? "PI_ACCOUNT" : (state.active ?? "default")}`,
-  );
+  const providerId = toProviderId(ctx.model?.provider);
+  const providerName = (providerId && states.get(providerId)?.adapter.displayName) || ctx.model?.provider;
   return [
     "Accounts",
     ...(fromEnvironment
       ? ["", "Account selection source: PI_ACCOUNT (process override). Unset it and restart Pi to switch accounts."]
       : []),
-    ...(selectionError ? ["", `Selection error: ${sanitizeTerminalText(selectionError)}`] : []),
+    ...(selectionError ? ["", `Selection error: ${terminalText(selectionError)}`] : []),
     "",
     "Current model:",
-    `  ${formatCurrentModel(ctx)}`,
+    ctx.model ? terminalText(`${providerName} / ${ctx.model.id}`) : "(none)",
     "",
     "Active accounts:",
-    ...activeLines,
+    ...sortedProviderStates(states).map(
+      (state) =>
+        `${state.adapter.displayName}: ${state.selectionInvalid ? "recovery required" : fromEnvironment ? "PI_ACCOUNT" : (state.active ?? "default")}`,
+    ),
     "",
     "What do you want to do?",
   ].join("\n");
 }
 
-function formatCurrentModel(ctx: ExtensionCommandContext): string {
-  if (!ctx.model) return "(none)";
-  const providerId = toProviderId(ctx.model.provider);
-  const providerName = providerId ? providerDisplayName(providerId) : ctx.model.provider;
-  return sanitizeTerminalText(`${providerName} / ${ctx.model.id}`);
+function terminalText(value: string): string {
+  return stripVTControlCharacters(value)
+    .replace(/[\t\r\n\u0085\u2028\u2029]/gu, " ")
+    .replace(/[\p{Cc}\p{Cf}]/gu, "");
 }
 
-function buildAccountMainItems(
+function mainOptions(
   states: Map<AccountProviderId, ProviderMenuState>,
   currentState: ProviderMenuState | undefined,
   hasAnyStoredAccount: boolean,
-  selectionInvalid = false,
-): Array<{
-  id: string;
-  label: string;
-  action: "login-route" | "switch-current" | "switch-route" | "remove-route";
-}> {
-  if (!hasAnyStoredAccount && !selectionInvalid) {
-    return [{ id: "login", label: LOGIN_ACTION, action: "login-route" }];
-  }
-  const currentHasAccounts = currentState ? accountNames(currentState).length > 0 : false;
-  if (currentState && (currentHasAccounts || currentState.selectionInvalid)) {
+  selectionInvalid: boolean,
+): string[] {
+  if (!hasAnyStoredAccount && !selectionInvalid) return [LOGIN_ACTION];
+  if (currentState && (accountNames(currentState).length > 0 || currentState.selectionInvalid)) {
     return [
-      {
-        id: currentState.id,
-        label: switchCurrentProviderAction(currentState.adapter),
-        action: "switch-current",
-      },
-      { id: "login", label: LOGIN_ACTION, action: "login-route" },
-      ...(hasAnyStoredAccount ? [{ id: "remove", label: REMOVE_ACTION, action: "remove-route" as const }] : []),
+      switchCurrentProviderAction(currentState.adapter),
+      LOGIN_ACTION,
+      ...(hasAnyStoredAccount ? [REMOVE_ACTION] : []),
       ...(providerStatesWithAccounts(states, currentState.id, selectionInvalid).length > 0
-        ? [
-            {
-              id: "switch-other",
-              label: SWITCH_ANOTHER_PROVIDER_ACTION,
-              action: "switch-route" as const,
-            },
-          ]
+        ? [SWITCH_ANOTHER_PROVIDER_ACTION]
         : []),
     ];
   }
   return [
-    { id: "login", label: LOGIN_ACTION, action: "login-route" },
-    {
-      id: "switch-provider",
-      label: currentState ? SWITCH_ANOTHER_PROVIDER_ACTION : SWITCH_PROVIDER_ACTION,
-      action: "switch-route",
-    },
-    ...(hasAnyStoredAccount ? [{ id: "remove", label: REMOVE_ACTION, action: "remove-route" as const }] : []),
+    LOGIN_ACTION,
+    currentState ? SWITCH_ANOTHER_PROVIDER_ACTION : SWITCH_PROVIDER_ACTION,
+    ...(hasAnyStoredAccount ? [REMOVE_ACTION] : []),
   ];
-}
-
-function accountItemId(accountName: string): string {
-  return `account:${encodeURIComponent(accountName)}`;
-}
-
-function removeAccountItemId(providerId: AccountProviderId, accountName: string): string {
-  return `${providerId}:${encodeURIComponent(accountName)}`;
 }
 
 function switchCurrentProviderAction(adapter: AccountProviderAdapter): string {
   return `Switch ${adapter.displayName} account`;
 }
 
-function sortedProviderStates(states: Map<AccountProviderId, ProviderMenuState>): ProviderMenuState[];
-function sortedProviderStates(states: readonly ProviderMenuState[]): ProviderMenuState[];
-function sortedProviderStates(
-  states: Map<AccountProviderId, ProviderMenuState> | readonly ProviderMenuState[],
-): ProviderMenuState[] {
-  const values = Array.isArray(states) ? [...states] : [...states.values()];
-  return values.sort((left, right) => left.adapter.displayName.localeCompare(right.adapter.displayName));
+function sortedProviderStates(states: Map<AccountProviderId, ProviderMenuState>): ProviderMenuState[] {
+  return [...states.values()].sort((left, right) => left.adapter.displayName.localeCompare(right.adapter.displayName));
 }
 
 function providerStatesWithAccounts(
@@ -508,37 +347,23 @@ function accountNames(state: ProviderMenuState): string[] {
 
 function switchAccountOptions(activeName: string | undefined, names: string[], selectionInvalid = false): string[] {
   const active = activeName ?? "default";
-  const sortedNames = [...names].sort();
-  if (selectionInvalid) return [...sortedNames, "default"];
-  const options = [formatSwitchAccountOption(active, true)];
-  for (const name of sortedNames) {
-    if (name !== active) options.push(formatSwitchAccountOption(name, false));
-  }
-  if (active !== "default") options.push(formatSwitchAccountOption("default", false));
-  return options;
-}
-
-function formatSwitchAccountOption(name: string, active: boolean): string {
-  return active ? `✓ ${name}` : name;
-}
-
-function stripActiveMarker(value: string): string {
-  return value.replace(/^✓\s+/, "");
+  return [
+    ...names.filter((name) => selectionInvalid || name !== active),
+    ...(selectionInvalid || active !== "default" ? ["default"] : []),
+  ];
 }
 
 function removeAccountOptions(
   states: Map<AccountProviderId, ProviderMenuState>,
   currentProviderId?: AccountProviderId,
 ): Array<{ label: string; adapter: AccountProviderAdapter; accountName: string }> {
-  const providerStates = providerStatesWithAccounts(states);
-  if (currentProviderId) {
-    const currentIndex = providerStates.findIndex((state) => state.id === currentProviderId);
-    if (currentIndex > 0) {
-      const [current] = providerStates.splice(currentIndex, 1);
-      if (current) providerStates.unshift(current);
-    }
+  const providers = providerStatesWithAccounts(states);
+  const currentIndex = providers.findIndex((state) => state.id === currentProviderId);
+  if (currentIndex > 0) {
+    const [current] = providers.splice(currentIndex, 1);
+    if (current) providers.unshift(current);
   }
-  return providerStates.flatMap((state) =>
+  return providers.flatMap((state) =>
     accountNames(state).map((accountName) => ({
       label: `${state.adapter.displayName} · ${accountName}`,
       adapter: state.adapter,
@@ -547,42 +372,8 @@ function removeAccountOptions(
   );
 }
 
-function providerDisplayName(providerId: AccountProviderId): string {
-  switch (providerId) {
-    case "anthropic":
-      return "Anthropic";
-    case "github-copilot":
-      return "GitHub Copilot";
-    case "kimi-coding":
-      return "Kimi For Coding";
-    case "meta":
-      return "Meta";
-    case "openai":
-      return "OpenAI";
-    case "openai-codex":
-      return "OpenAI Codex";
-    case "openrouter":
-      return "OpenRouter";
-    case "radius":
-      return "Radius";
-    case "xai":
-      return "xAI";
-  }
-}
-
-function requireAdapter(
-  adapters: Map<AccountProviderId, AccountProviderAdapter>,
-  providerId: AccountProviderId,
-): AccountProviderAdapter {
-  const adapter = adapters.get(providerId);
-  if (!adapter) throw new Error(`Unsupported account provider: ${providerId}`);
-  return adapter;
-}
-
 function toProviderId(value: string | undefined): AccountProviderId | undefined {
-  return value && isAccountProviderId(value) ? value : undefined;
-}
-
-function isAccountProviderId(value: string): value is AccountProviderId {
-  return (SUPPORTED_PROVIDER_IDS as readonly string[]).includes(value);
+  return value && (SUPPORTED_PROVIDER_IDS as readonly string[]).includes(value)
+    ? (value as AccountProviderId)
+    : undefined;
 }

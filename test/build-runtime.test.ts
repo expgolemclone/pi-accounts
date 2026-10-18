@@ -11,7 +11,6 @@ isolateAccountEnvironment();
 const { packageRoot, loadBuilder } = registerRuntimeBuilderContract({
   packageId: "pi-accounts",
   forbiddenEagerInputs: ["src/account-menu.ts"],
-  forbiddenEagerExternals: ["@narumitw/pi-tui-kit"],
 });
 
 test("generated runtime is loadable by Pi's Jiti resource loader", async () => {

@@ -830,20 +830,25 @@ async function removeAccount(
   const parsed = parseAccountName(nameArg);
   if (!parsed.ok) return ctx.ui.notify(parsed.error, "warning");
   let removed = false;
-  await store.updateProvider(adapter.id, (state) => {
-    if (!isCurrent() || !getOwnCredential(state.accounts, parsed.name)) return state;
-    removed = true;
-    const accounts = defineOwnMap(state.accounts);
-    delete accounts[parsed.name];
-    return {
-      ...state,
-      active: state.active === parsed.name ? undefined : state.active,
-      accounts,
-      ...(adapter.id === "openai" && readSharedSelection(state)?.account === parsed.name
-        ? { sharedSelection: { account: null, revision: randomUUID() } }
-        : {}),
-    };
-  });
+  try {
+    await store.updateProvider(adapter.id, (state) => {
+      if (!isCurrent() || !getOwnCredential(state.accounts, parsed.name)) return state;
+      removed = true;
+      const accounts = defineOwnMap(state.accounts);
+      delete accounts[parsed.name];
+      return {
+        ...state,
+        active: state.active === parsed.name ? undefined : state.active,
+        accounts,
+        ...(adapter.id === "openai" && readSharedSelection(state)?.account === parsed.name
+          ? { sharedSelection: { account: null, revision: randomUUID() } }
+          : {}),
+      };
+    });
+  } catch {
+    if (isCurrent()) ctx.ui.notify("Could not remove the account. Check account storage and try again.", "error");
+    return;
+  }
   if (!isCurrent()) return;
   if (!removed) {
     ctx.ui.notify(`${adapter.displayName} account "${parsed.name}" was not found.`, "warning");

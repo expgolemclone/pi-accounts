@@ -12,7 +12,6 @@ export const { buildRuntime, validateEagerGraph, validateGeneratedFiles, publish
     "// @ts-nocheck -- generated JavaScript uses a .ts extension for Pi's Jiti loader.",
   ].join("\n"),
   forbiddenEagerInputs: ["src/account-menu.ts"],
-  forbiddenEagerExternals: ["@narumitw/pi-tui-kit"],
 });
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
