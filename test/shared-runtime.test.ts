@@ -12,7 +12,6 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { test } from "vitest";
 import { AccountStore } from "../src/account-store.js";
 import accountsExtension, { type AccountsDependencies } from "../src/accounts.js";
@@ -274,7 +273,7 @@ test("tool continuation adopts a shared manual switch and preserves the complete
         name: "switch_fixture",
         label: "Switch fixture",
         description: "Offline fixture",
-        parameters: Type.Object({}),
+        parameters: { type: "object", properties: {} },
         execute: async () => {
           await selection.select("b");
           return { content: [{ type: "text", text: "COMPLETED_TOOL_RESULT" }], details: {} };
