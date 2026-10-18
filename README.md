@@ -1,3 +1,5 @@
+Based on [narumiruna/pi-extensions](https://github.com/narumiruna/pi-extensions).
+
 # 🔐 pi-accounts — Switch Between Provider Accounts
 
 [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
