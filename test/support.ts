@@ -1,5 +1,3 @@
-import os from "node:os";
-import path from "node:path";
 import { Key, type KeyId, matchesKey } from "@earendil-works/pi-tui";
 
 type MockHandler = (...args: unknown[]) => unknown;
@@ -10,23 +8,8 @@ type MockCommand = {
   getArgumentCompletions?: (prefix: string) => unknown;
 };
 
-type MockTool = {
-  name?: string;
-  [key: string]: unknown;
-};
-
-type MockFlag = {
-  value?: unknown;
-  [key: string]: unknown;
-};
-
 type MockPiApi = {
   registerCommand(name: string, command: unknown): void;
-  registerShortcut(shortcut: KeyId, options: unknown): void;
-  registerFlag(name: string, flag: unknown): void;
-  registerTool(tool: unknown): void;
-  registerMessageRenderer(customType: string, renderer: MockHandler): void;
-  registerEntryRenderer(customType: string, renderer: MockHandler): void;
   registerProvider(name: string, config: unknown): void;
   unregisterProvider(name: string): void;
   on(name: string, handler: MockHandler): void;
@@ -35,43 +18,18 @@ type MockPiApi = {
     on: (channel: string, handler: (data: unknown) => void) => () => void;
     clear: () => void;
   };
-  getFlag(name: string): unknown;
-  getActiveTools(): string[];
-  setActiveTools(names: string[]): void;
-  getAllTools(): unknown[];
-  getThinkingLevel(): string;
-  setThinkingLevel(level: string): void;
   appendEntry(customType: string, data: unknown): void;
-  sendUserMessage(text: string, messageOptions?: unknown): void;
-  sendMessage(message: unknown, messageOptions?: unknown): void;
-  setSessionName(name: string): void;
-  getSessionName(): string | undefined;
   setModel(model: unknown): Promise<boolean>;
 };
 
-export function createMockPi(
-  options: {
-    activeTools?: string[];
-    allTools?: unknown[];
-    thinkingLevel?: string;
-    clampThinkingLevel?: (level: string) => string;
-  } = {},
-) {
+export function createMockPi() {
   const commands = new Map<string, MockCommand>();
-  const shortcuts = new Map<KeyId, { description?: string; handler: MockHandler }>();
-  const messageRenderers = new Map<string, MockHandler>();
-  const entryRenderers = new Map<string, MockHandler>();
-  const flags = new Map<string, MockFlag>();
   const events = new Map<string, MockHandler[]>();
-  const tools: MockTool[] = [];
   const providers = new Map<string, unknown>();
   const providerRegistrations: Array<{ name: string; config: unknown }> = [];
   const providerUnregistrations: string[] = [];
   const entries: Array<{ customType: string; data: unknown }> = [];
-  const sentUserMessages: Array<{ text: string; options?: unknown }> = [];
-  const sentMessages: Array<{ message: unknown; options?: unknown }> = [];
   const setModels: unknown[] = [];
-  const thinkingLevels: string[] = [];
   const eventBusSubscriptions = new Map<string, Array<(data: unknown) => void>>();
   const eventBus = {
     emit(channel: string, data: unknown) {
@@ -99,29 +57,9 @@ export function createMockPi(
       eventBusSubscriptions.clear();
     },
   };
-  let thinkingLevel = options.thinkingLevel ?? "off";
-  let sessionName: string | undefined;
-  let activeTools = [...(options.activeTools ?? [])];
-  const allTools = options.allTools ?? activeTools.map((name) => builtinTool(name));
-
   const rawPi: MockPiApi = {
     registerCommand(name: string, command: unknown) {
       commands.set(name, command as MockCommand);
-    },
-    registerShortcut(shortcut: KeyId, options: unknown) {
-      shortcuts.set(shortcut, options as { description?: string; handler: MockHandler });
-    },
-    registerFlag(name: string, flag: unknown) {
-      flags.set(name, flag as MockFlag);
-    },
-    registerTool(tool: unknown) {
-      tools.push(tool as MockTool);
-    },
-    registerMessageRenderer(customType: string, renderer: MockHandler) {
-      messageRenderers.set(customType, renderer);
-    },
-    registerEntryRenderer(customType: string, renderer: MockHandler) {
-      entryRenderers.set(customType, renderer);
     },
     registerProvider(name: string, config: unknown) {
       const previous = providers.get(name);
@@ -144,39 +82,8 @@ export function createMockPi(
     on(name: string, handler: MockHandler) {
       events.set(name, [...(events.get(name) ?? []), handler]);
     },
-    getFlag(name: string) {
-      return flags.get(name)?.value;
-    },
-    getActiveTools() {
-      return [...activeTools];
-    },
-    setActiveTools(names: string[]) {
-      activeTools = [...names];
-    },
-    getAllTools() {
-      return allTools;
-    },
-    getThinkingLevel() {
-      return thinkingLevel;
-    },
-    setThinkingLevel(level: string) {
-      thinkingLevel = options.clampThinkingLevel?.(level) ?? level;
-      thinkingLevels.push(thinkingLevel);
-    },
     appendEntry(customType: string, data: unknown) {
       entries.push({ customType, data });
-    },
-    setSessionName(name: string) {
-      sessionName = name;
-    },
-    getSessionName() {
-      return sessionName;
-    },
-    sendUserMessage(text: string, messageOptions?: unknown) {
-      sentUserMessages.push({ text, options: messageOptions });
-    },
-    sendMessage(message: unknown, messageOptions?: unknown) {
-      sentMessages.push({ message, options: messageOptions });
     },
     async setModel(model: unknown) {
       setModels.push(model);
@@ -189,38 +96,19 @@ export function createMockPi(
     pi: rawPi as never,
     rawPi,
     commands,
-    shortcuts,
-    messageRenderers,
-    entryRenderers,
-    flags,
     events,
     eventBus,
-    tools,
     providers,
     providerRegistrations,
     providerUnregistrations,
     entries,
-    sentUserMessages,
-    sentMessages,
     setModels,
-    thinkingLevels,
-    get thinkingLevel() {
-      return thinkingLevel;
-    },
-    get sessionName() {
-      return sessionName;
-    },
   };
 }
 
 export function createMockContext(overrides: Record<string, unknown> = {}) {
   const notifications: Array<{ message: string; level?: string }> = [];
   const statuses = new Map<string, string | undefined>();
-  const widgets = new Map<string, unknown>();
-  let footer: unknown;
-  let editorText = String(overrides.editorText ?? "");
-  const pastedEditorTexts: string[] = [];
-  const pasteOverride = overrides.pasteToEditor as ((text: string) => void) | undefined;
   const selectOverride = overrides.select as
     | ((title: string, options: string[]) => Promise<string | undefined>)
     | undefined;
@@ -301,37 +189,13 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
       setStatus(key: string, value: string | undefined) {
         statuses.set(key, value);
       },
-      setWidget(key: string, value: unknown) {
-        widgets.set(key, value);
-      },
-      setFooter(value: unknown) {
-        footer = value;
-      },
-      pasteToEditor(value: string) {
-        pastedEditorTexts.push(value);
-        if (pasteOverride) pasteOverride(value);
-        else editorText += value;
-      },
-      setEditorText(value: string) {
-        editorText = value;
-      },
-      getEditorText() {
-        return editorText;
-      },
       confirm: overrides.confirm ?? (async () => true),
       input: overrides.input ?? (async () => undefined),
       select: overrides.select ?? (async () => undefined),
-      editor: overrides.editor ?? (async () => undefined),
       custom,
-      onTerminalInput: overrides.onTerminalInput ?? (() => () => undefined),
     },
     isIdle: overrides.isIdle ?? (() => true),
-    hasPendingMessages: overrides.hasPendingMessages ?? (() => false),
-    isProjectTrusted: overrides.isProjectTrusted ?? (() => false),
     abort: overrides.abort ?? (() => undefined),
-    waitForIdle: overrides.waitForIdle ?? (async () => undefined),
-    reload: overrides.reload ?? (async () => undefined),
-    getContextUsage: overrides.getContextUsage ?? (() => undefined),
     sessionManager: overrides.sessionManager ?? {
       getSessionId: () => "test-session",
       getSessionName: () => undefined,
@@ -351,14 +215,6 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     ctx: ctx as never,
     notifications,
     statuses,
-    widgets,
-    pastedEditorTexts,
-    get footer() {
-      return footer;
-    },
-    get editorText() {
-      return editorText;
-    },
   };
 }
 
@@ -476,29 +332,5 @@ export function createCustomSelectorHarness(
     get result() {
       return result;
     },
-  };
-}
-
-export function driveCustomSelector(
-  factory: unknown,
-  inputs: readonly string[],
-  width = 100,
-): { renders: string[][]; result: unknown } {
-  const harness = createCustomSelectorHarness(factory, width);
-  const renders = inputs.map((input) => harness.handleInput(input));
-  return { renders, result: harness.result };
-}
-
-export function builtinTool(name: string) {
-  return {
-    name,
-    sourceInfo: { source: "builtin", scope: "builtin" },
-  };
-}
-
-export function extensionTool(name: string) {
-  return {
-    name,
-    sourceInfo: { source: "extension", scope: "user", path: path.join(os.tmpdir(), name) },
   };
 }

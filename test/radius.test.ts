@@ -83,18 +83,9 @@ test("Radius publishes the selected account catalog through Pi's real model runt
       refreshOnCreate: false,
     });
     const registry = new ModelRegistry(runtime);
-    const selectedModels: unknown[] = [];
-    const pi = {
-      registerProvider: registry.registerProvider.bind(registry),
-      unregisterProvider: registry.unregisterProvider.bind(registry),
-      async setModel(model: unknown) {
-        selectedModels.push(model);
-        return true;
-      },
-    };
     const radius = createBuiltinProviderAdapters().find((provider) => provider.id === "radius");
     assert.ok(radius);
-    const coordinator = new RuntimeAuthCoordinator(pi as never, radius);
+    const coordinator = new RuntimeAuthCoordinator(radius);
     const store = new AccountStore(new InMemoryAccountStorageBackend());
     await store.write({
       version: 1,
@@ -139,7 +130,6 @@ test("Radius publishes the selected account catalog through Pi's real model runt
     const secondContext = createMockContext({ model: firstModel, modelRegistry: registry }).ctx;
     assert.equal((await coordinator.ensureActive(secondContext, store, "work")).status, "active");
     assert.deepEqual(requests, ["Bearer access-refreshed", "Bearer access-two"]);
-    assert.equal(selectedModels.length, 0);
     assert.equal(firstModel?.baseUrl, "http://inference.two.radius.test/v1");
   } finally {
     await rm(root, { recursive: true, force: true });

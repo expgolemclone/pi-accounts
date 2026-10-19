@@ -7,78 +7,17 @@ import { type ExtensionContext, getPackageDir } from "@earendil-works/pi-coding-
 import { createJiti } from "jiti";
 import { type AccountStore, credentialGeneration, getOwnCredential, type StoredCredential } from "./account-store.js";
 import { type AccountProviderAdapter, resolveProviderOAuth } from "./oauth.js";
-import { isQuotaFailureReason, QuotaRecoveryError } from "./quota-failure.js";
+import { type ProbeInput, parseProbeReply } from "./quota/probe-protocol.js";
+import { QuotaRecoveryError } from "./quota-failure.js";
 import { refreshAccountCredential } from "./runtime-auth.js";
 
-// Runs in a fresh Node process using Pi's SDK, not a nested call in the failed conversation.
-// Resources, settings, credentials, tools and history are explicitly in-memory/empty.
-const WORKER = `
-process.once("message", async (input) => {
-  let session, failure = "initialization", status;
-  try {
-    const sdk = await import(input.sdk);
-    const ai = await import(input.ai);
-    // Node does not strip .ts inside node_modules, including Pi's generated
-    // JavaScript-in-.ts runtime. Use the same standard loader as Pi for this helper.
-    const { createJiti } = await import(input.jiti);
-    const quota = await createJiti(input.quota, { fsCache: false, moduleCache: false, tryNative: false }).import(input.quota);
-    const evidence = quota.captureQuotaEvidence(async (...args) => {
-      const response = await fetch(...args);
-      status = response.status;
-      return response;
-    });
-    const runtime = await sdk.ModelRuntime.create({
-      credentials: new ai.InMemoryCredentialStore(), modelsStore: new ai.InMemoryModelsStore(),
-      modelsPath: null, refreshOnCreate: false,
-    });
-    const native = runtime.getProvider("openai");
-    if (!native) throw new Error("native OpenAI provider unavailable");
-    runtime.registerProvider("openai", { api: "openai-responses", streamSimple: (model, context, options) => native.streamSimple(model, context, { ...options, maxRetries: 0, fetch: evidence.fetch }) });
-    await runtime.setRuntimeApiKey("openai", input.auth.apiKey);
-    const resolved = await runtime.getAuth(input.model);
-    failure = "authentication";
-    if (resolved?.auth.apiKey !== input.auth.apiKey) throw new Error("probe auth conflict");
-    for (const [name, value] of Object.entries(resolved.auth.headers ?? {})) {
-      if (name.toLowerCase() === "authorization" && value !== "Bearer " + input.auth.apiKey) throw new Error("probe header conflict");
-    }
-    failure = "initialization";
-    const resources = {
-      getExtensions: () => ({ extensions: [], errors: [], runtime: sdk.createExtensionRuntime() }),
-      getSkills: () => ({ skills: [], diagnostics: [] }), getPrompts: () => ({ prompts: [], diagnostics: [] }),
-      getThemes: () => ({ themes: [], diagnostics: [] }), getAgentsFiles: () => ({ agentsFiles: [] }),
-      getSystemPrompt: () => "Reply to ping with exactly pong. Do not use tools.",
-      getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [],
-      extendResources: () => {}, reload: async () => {},
-    };
-    ({ session } = await sdk.createAgentSession({ cwd: input.directory, agentDir: input.directory,
-      model: input.model, modelRuntime: runtime, resourceLoader: resources,
-      tools: [], noTools: "all", thinkingLevel: "off",
-      sessionManager: sdk.SessionManager.inMemory(input.directory),
-      settingsManager: sdk.SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } }),
-    }));
-    failure = "transport";
-    await session.prompt("ping");
-    failure = "reply";
-    const terminal = session.messages.filter((message) => message.role === "assistant").at(-1);
-    if (!terminal) throw new Error("missing probe result");
-    const text = terminal.content.filter((part) => part.type === "text").map((part) => part.text).join("").trim();
-    const result = terminal.stopReason === "stop" && text === "pong" && terminal.content.every((part) => part.type === "text" || part.type === "thinking")
-      ? { kind: "pong" } : terminal.stopReason === "error"
-        ? (evidence.limited() ?? quota.isOpenAIQuotaError(terminal.errorMessage))
-          ? { kind: "quota" }
-          : { kind: "failed", reason: status === 401 || status === 403 ? "authentication" : status === undefined ? "transport" : "provider" }
-        : { kind: "failed", reason: "reply" };
-    session.dispose(); session = undefined;
-    process.send(result, () => process.disconnect());
-  } catch {
-    session?.dispose();
-    process.send({ kind: "failed", reason: failure }, () => process.disconnect());
-  }
-});
-process.send({ kind: "ready" });
+// Node does not strip TypeScript inside node_modules. Only loader bootstrap is untyped;
+// inference, resource isolation and IPC handling live in the typechecked worker module.
+const WORKER_BOOTSTRAP = `
+const { createJiti } = await import(process.argv[1]);
+const worker = await createJiti(process.argv[2], { fsCache: false, moduleCache: false, tryNative: false }).import(process.argv[2]);
+worker.startProbeWorker();
 `;
-
-type ProbeReply = { kind?: unknown; reason?: unknown };
 
 export async function runProbeProcess(
   model: Model<Api>,
@@ -92,9 +31,9 @@ export async function runProbeProcess(
   let ai: string;
   let sdk: string;
   let jiti: string;
-  let quota: typeof import("./quota-errors.js");
+  let worker: typeof import("./quota/probe-worker.js");
   try {
-    quota = await import("./quota-errors.js");
+    worker = await import("./quota/probe-worker.js");
     // Bundled Pi supplies virtual peer imports, not files beneath this extension.
     // Resolve public package exports from the running Node host, never install peer copies.
     const host = createJiti(join(getPackageDir(), "package.json"));
@@ -130,12 +69,16 @@ export async function runProbeProcess(
       ]) {
         if (process.env[name] !== undefined) env[name] = process.env[name];
       }
-      const child = spawn(process.execPath, ["--input-type=module", "--eval", WORKER], {
-        cwd: directory,
-        env,
-        stdio: ["ignore", "ignore", "ignore", "ipc"],
-        windowsHide: true,
-      });
+      const child = spawn(
+        process.execPath,
+        ["--input-type=module", "--eval", WORKER_BOOTSTRAP, jiti, worker.workerModuleURL],
+        {
+          cwd: directory,
+          env,
+          stdio: ["ignore", "ignore", "ignore", "ipc"],
+          windowsHide: true,
+        },
+      );
       let ready = false;
       let reply: "pong" | "quota" | undefined;
       let failure: Error | undefined;
@@ -149,8 +92,8 @@ export async function runProbeProcess(
       signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted) abort();
       child.on("message", (value: unknown) => {
-        if (!value || typeof value !== "object" || ++messages > 2) return stop(new QuotaRecoveryError("protocol"));
-        const result = value as ProbeReply;
+        const result = parseProbeReply(value);
+        if (!result || ++messages > 2) return stop(new QuotaRecoveryError("protocol"));
         if (!ready) {
           if (result.kind !== "ready") return stop(new QuotaRecoveryError("protocol"));
           ready = true;
@@ -161,24 +104,17 @@ export async function runProbeProcess(
             {
               sdk,
               ai,
-              quota: quota.quotaModuleURL,
-              jiti,
               model,
-              auth,
+              auth: { ...auth, apiKey: auth.apiKey as string },
               directory,
-            },
+            } satisfies ProbeInput,
             (error) => {
               if (error) stop(new QuotaRecoveryError("launch"));
             },
           );
         } else if (result.kind === "pong") reply = "pong";
         else if (result.kind === "quota") reply = "quota";
-        else
-          stop(
-            new QuotaRecoveryError(
-              result.kind === "failed" && isQuotaFailureReason(result.reason) ? result.reason : "protocol",
-            ),
-          );
+        else stop(new QuotaRecoveryError(result.kind === "failed" ? result.reason : "protocol"));
       });
       child.on("error", () => stop(new QuotaRecoveryError("launch")));
       child.once("close", (code) => {

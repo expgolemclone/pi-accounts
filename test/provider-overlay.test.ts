@@ -15,7 +15,7 @@ import { AccountStore, InMemoryAccountStorageBackend } from "../src/account-stor
 import type { AccountProviderAdapter, AccountProviderId } from "../src/oauth.js";
 import { RuntimeAuthCoordinator } from "../src/runtime-auth.js";
 import { isolateAccountEnvironment } from "./isolate-account-environment.js";
-import { createMockContext, createMockPi } from "./support.js";
+import { createMockContext } from "./support.js";
 
 isolateAccountEnvironment();
 const credential = {
@@ -61,7 +61,6 @@ async function fixture(id: AccountProviderId = "github-copilot") {
   };
   const { ctx } = createMockContext({ modelRegistry: registry, sessionManager: SessionManager.inMemory() });
   const coordinator = new RuntimeAuthCoordinator(
-    createMockPi().pi,
     adapter,
     undefined,
     id === "openai" ? () => (stream) => stream : undefined,

@@ -37,7 +37,7 @@ async function setup() {
 
 for (const mode of ["tui", "rpc"] as const) {
   for (const result of ["switch", "removed", "shutdown"] as const) {
-    test(`${mode} native account switch revalidates ${result} after selection`, async () => {
+    test(`${mode} native account switch delegates ${result} to activation unless cancelled`, async () => {
       const { store, owner, controller } = await setup();
       const choices = ["Switch Anthropic account", "beta"];
       const switched: string[] = [];
@@ -74,7 +74,7 @@ for (const mode of ["tui", "rpc"] as const) {
         },
         owner,
       );
-      assert.deepEqual(switched, result === "switch" ? ["beta"] : []);
+      assert.deepEqual(switched, result === "shutdown" ? [] : ["beta"]);
       assert.equal(store.read().providers.anthropic?.active, "alpha");
     });
   }

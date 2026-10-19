@@ -9,7 +9,7 @@ import {
   type ProviderHeaders,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { StoredCredential } from "./account-store.js";
+import { defineOwn, getOwnCredential, type StoredCredential } from "./account-store.js";
 import type { AccountActivationErrorCode } from "./accounts-protocol.js";
 import { EffectiveAuthConflictError, verifyModelApiKeyAuth } from "./model-auth-verification.js";
 import { type AccountProviderAdapter, type AccountProviderId, resolveProviderOAuth } from "./oauth.js";
@@ -111,7 +111,6 @@ export class RuntimeAuthCoordinator {
   private activeCredentialOffer: ActiveCredentialOffer | undefined;
 
   constructor(
-    _pi: ExtensionAPI,
     readonly provider: AccountProviderAdapter,
     private readonly failClosedApiKey = RUNTIME_FAIL_CLOSED_API_KEY,
     private readonly trackRequest?: (
@@ -1063,25 +1062,6 @@ async function getApiKeyAndHeaders(
     ) => Promise<{ ok: true; apiKey?: string; headers?: ProviderHeaders } | { ok: false; error: string }>;
   };
   return typeof registry.getApiKeyAndHeaders === "function" ? registry.getApiKeyAndHeaders(model) : undefined;
-}
-
-function defineOwn(
-  accounts: Record<string, StoredCredential>,
-  name: string,
-  credential: StoredCredential,
-): Record<string, StoredCredential> {
-  const next = Object.assign(Object.create(null), accounts) as Record<string, StoredCredential>;
-  Object.defineProperty(next, name, {
-    configurable: true,
-    enumerable: true,
-    value: credential,
-    writable: true,
-  });
-  return next;
-}
-
-function getOwnCredential(accounts: Record<string, StoredCredential>, name: string): StoredCredential | undefined {
-  return Object.hasOwn(accounts, name) ? accounts[name] : undefined;
 }
 
 function readProviderRegistration(ctx: ExtensionContext, providerId: string): RuntimeProviderRegistration | undefined {

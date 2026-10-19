@@ -1,8 +1,5 @@
 import { createParser } from "eventsource-parser";
 
-// The probe imports this same module in its isolated Node process. The dynamic
-// import in quota-probe keeps its named exports available in the split runtime.
-export const quotaModuleURL = import.meta.url;
 export const OPENAI_QUOTA_CODE = "subscription_sharing_usage_limit_exceeded";
 export const OPENAI_QUOTA_MESSAGE =
   "The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.";

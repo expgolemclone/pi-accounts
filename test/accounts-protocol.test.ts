@@ -503,6 +503,45 @@ test("cancellation during inventory read does not publish a selection", async ()
   }
 });
 
+test("cancellation while shared selection publication is queued cannot change the selection", async () => {
+  const { mock, store, session } = await fixture();
+  const current = await session();
+  await activate(mock, current.manager, "beta");
+  const before = (await store.readProviderAsync("openai")).sharedSelection;
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const update = store.updateProviderAsync.bind(store);
+  let pause = true;
+  store.updateProviderAsync = async (...args) => {
+    if (pause) {
+      pause = false;
+      entered();
+      await gate;
+    }
+    return update(...args);
+  };
+  const controller = new AbortController();
+  const pending = activate(mock, current.manager, "alpha", { signal: controller.signal });
+  try {
+    await started;
+    controller.abort();
+    release();
+    assert.equal((await pending).code, "cancelled");
+    assert.deepEqual((await store.readProviderAsync("openai")).sharedSelection, before);
+    assert.equal(await current.registry.getApiKeyForProvider("openai"), key);
+  } finally {
+    release();
+    await pending;
+    await mock.events.get("session_shutdown")?.[0]?.({}, current.ctx);
+  }
+});
+
 test("shutdown cancels an activation waiting for the credential store", async () => {
   const { mock, store, session } = await fixture();
   const current = await session();

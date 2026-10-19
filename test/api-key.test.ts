@@ -70,7 +70,6 @@ for (const adapter of createBuiltinProviderAdapters().filter((provider) => provi
       refreshOnCreate: false,
     });
     const registry = new ModelRegistry(runtime);
-    const mock = createMockPi();
     const provider = {
       ...adapter,
       refreshModelCatalogAfterAuth: false,
@@ -86,7 +85,7 @@ for (const adapter of createBuiltinProviderAdapters().filter((provider) => provi
         },
       },
     };
-    const coordinator = new RuntimeAuthCoordinator(mock.pi, provider);
+    const coordinator = new RuntimeAuthCoordinator(provider);
     const store = new AccountStore(new InMemoryAccountStorageBackend());
     await store.updateProvider(adapter.id, () => ({ accounts: { api: { type: "api_key", key: "sk-fixture" } } }));
     const sessionManager = SessionManager.inMemory(process.cwd());
@@ -127,12 +126,11 @@ for (const id of ["openai", "meta", "kimi-coding"] as const) {
     await store.updateProvider(id, () => ({
       accounts: { subscription: oauth, api: { type: "api_key", key: "sk-fixture" } },
     }));
-    const mock = createMockPi();
     const { ctx } = createMockContext({
       modelRegistry: registry,
       sessionManager: SessionManager.inMemory(process.cwd()),
     });
-    const coordinator = new RuntimeAuthCoordinator(mock.pi, adapter);
+    const coordinator = new RuntimeAuthCoordinator(adapter);
     for (const name of ["subscription", "api", "subscription"]) {
       assert.equal((await coordinator.ensureActive(ctx, store, name)).status, "active");
       const model = registry.getAll().find((item) => item.provider === id);
@@ -172,7 +170,7 @@ test("API key activation errors redact the exact key and fail closed; legacy Cod
     const adapter = createBuiltinProviderAdapters().find((provider) => provider.id === id);
     assert.ok(adapter);
     const { ctx } = createMockContext({ modelRegistry: registry });
-    const coordinator = new RuntimeAuthCoordinator(createMockPi().pi, adapter);
+    const coordinator = new RuntimeAuthCoordinator(adapter);
     const result = await coordinator.ensureActive(ctx, store, "api");
     assert.equal(result.status, "error");
     assert.doesNotMatch(JSON.stringify(result), /private-key-value/);

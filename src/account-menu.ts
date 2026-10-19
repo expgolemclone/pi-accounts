@@ -92,9 +92,6 @@ export async function showAccountsMenu(
         );
         return false;
       }
-      const latest = await store.readProviderAsync(providerId);
-      if (!isCurrent()) return true;
-      if (name !== "default" && !getOwnCredential(latest.accounts, name)) continue;
       await handlers.switch(provider.adapter, name, owner.signal, isCurrent);
       return true;
     }

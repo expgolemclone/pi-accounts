@@ -1,17 +1,11 @@
-import { lstatSync, readdirSync, rmSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import type { OAuthCredential } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { readPrivateFileSync } from "@expgolemclone/pi-private-files";
 import { type AccountProviderId, SUPPORTED_PROVIDER_IDS } from "./oauth.js";
 import { type AccountStorageBackend, FileAccountStorageBackend, InMemoryAccountStorageBackend } from "./storage.js";
 
 export const ACCOUNTS_FILE = "pi-accounts.json";
-export const LEGACY_CODEX_ACCOUNTS_FILE = "pi-codex-accounts.json";
-const OLDEST_CODEX_ACCOUNTS_FILE = "codex-accounts.json";
 const ACCOUNT_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
-const MIGRATION_LOCK_TIMEOUT_MS = 30_000;
-const MIGRATION_TEMP_STALE_MS = 30_000;
 
 export type StoredOAuthCredential = OAuthCredential;
 
@@ -305,169 +299,8 @@ function stringifyAccountsData(data: AccountsData): string {
   return `${JSON.stringify(normalizeAccountsData(data), null, 2)}\n`;
 }
 
-export type MigrationResult = {
-  status: "missing" | "canonical" | "migrated";
-  notice?: string;
-};
-
-export async function migrateLegacyCodexAccountsFile(
-  legacyPath: string,
-  canonicalPath: string,
-): Promise<MigrationResult> {
-  cleanupStaleMigrationTemps(canonicalPath);
-  if (pathEntryExists(canonicalPath)) {
-    validateCanonicalAccountsFile(canonicalPath);
-    return { status: "canonical" };
-  }
-  if (!pathEntryExists(legacyPath)) return { status: "missing" };
-  enforcePrivateRegularFile(legacyPath);
-  const backend = new FileAccountStorageBackend(legacyPath, {
-    syncLockTimeoutMs: MIGRATION_LOCK_TIMEOUT_MS,
-  });
-  return backend.readAsync<MigrationResult>(async (raw) => {
-    const contents = stringifyAccountsData(migrateReleasedCodexData(raw));
-    const status = await installMigratedAccountsFile(canonicalPath, contents);
-    if (status === "canonical") return { status };
-    enforcePrivateRegularFile(legacyPath);
-    return {
-      status,
-      notice: `${LEGACY_CODEX_ACCOUNTS_FILE} was copied into ${ACCOUNTS_FILE}. The private legacy file was retained for rollback but may become stale after OAuth refresh; do not load both extensions together.`,
-    };
-  });
-}
-
-function migrateReleasedCodexData(raw: string | undefined): AccountsData {
-  if (!raw?.trim()) return emptyAccountsData();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw) as unknown;
-  } catch {
-    throw new Error(`Invalid legacy Codex accounts JSON in ${LEGACY_CODEX_ACCOUNTS_FILE}.`);
-  }
-  if (!isRecord(parsed) || !isRecord(parsed.accounts)) {
-    throw new Error("Invalid legacy Codex accounts data.");
-  }
-  const state = normalizeProviderState({ active: parsed.active, accounts: parsed.accounts });
-  return {
-    version: 1,
-    providers: defineOwn(Object.create(null) as Record<string, ProviderAccountsData>, "openai-codex", state),
-  };
-}
-
-let pendingMigrationNotice: string | undefined;
-
 function createDefaultBackend(): AccountStorageBackend {
-  const agentDir = getAgentDir();
-  const canonical = join(agentDir, ACCOUNTS_FILE);
-  const legacyCandidates = [join(agentDir, LEGACY_CODEX_ACCOUNTS_FILE), join(agentDir, OLDEST_CODEX_ACCOUNTS_FILE)];
-  pendingMigrationNotice = undefined;
-  for (const legacy of legacyCandidates) {
-    if (!pathEntryExists(legacy) && !pathEntryExists(canonical)) continue;
-    const result = migrateLegacyCodexAccountsFileSync(legacy, canonical);
-    if (result.notice) pendingMigrationNotice = result.notice;
-    if (result.status !== "missing") break;
-  }
-  return new FileAccountStorageBackend(canonical);
-}
-
-function migrateLegacyCodexAccountsFileSync(legacyPath: string, canonicalPath: string): MigrationResult {
-  cleanupStaleMigrationTemps(canonicalPath);
-  if (pathEntryExists(canonicalPath)) {
-    validateCanonicalAccountsFile(canonicalPath);
-    return { status: "canonical" };
-  }
-  if (!pathEntryExists(legacyPath)) return { status: "missing" };
-  enforcePrivateRegularFile(legacyPath);
-  return new FileAccountStorageBackend(legacyPath, {
-    syncLockTimeoutMs: MIGRATION_LOCK_TIMEOUT_MS,
-  }).read<MigrationResult>((raw) => {
-    const contents = stringifyAccountsData(migrateReleasedCodexData(raw));
-    const status = installMigratedAccountsFileSync(canonicalPath, contents);
-    if (status === "canonical") return { status };
-    enforcePrivateRegularFile(legacyPath);
-    return {
-      status,
-      notice: `${legacyPath.endsWith(OLDEST_CODEX_ACCOUNTS_FILE) ? OLDEST_CODEX_ACCOUNTS_FILE : LEGACY_CODEX_ACCOUNTS_FILE} was copied into ${ACCOUNTS_FILE}. The private legacy file was retained for rollback but may become stale after OAuth refresh; do not load both extensions together.`,
-    };
-  });
-}
-
-function cleanupStaleMigrationTemps(canonicalPath: string): void {
-  const parent = dirname(canonicalPath);
-  const prefix = `.${basename(canonicalPath)}.`;
-  let names: string[];
-  try {
-    names = readdirSync(parent);
-  } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) return;
-    throw error;
-  }
-  for (const name of names) {
-    if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
-    const candidate = join(parent, name);
-    try {
-      const info = lstatSync(candidate);
-      if (Date.now() - info.mtimeMs >= MIGRATION_TEMP_STALE_MS) rmSync(candidate, { force: true });
-    } catch (error) {
-      if (!hasErrorCode(error, "ENOENT")) throw error;
-    }
-  }
-}
-
-async function installMigratedAccountsFile(filePath: string, contents: string): Promise<"canonical" | "migrated"> {
-  return new FileAccountStorageBackend(filePath, {
-    syncLockTimeoutMs: MIGRATION_LOCK_TIMEOUT_MS,
-  }).withLockAsync(async (current) => {
-    if (current !== undefined) {
-      parseAccountsData(current);
-      return { result: "canonical" as const };
-    }
-    return { result: "migrated" as const, next: contents };
-  });
-}
-
-function installMigratedAccountsFileSync(filePath: string, contents: string): "canonical" | "migrated" {
-  return new FileAccountStorageBackend(filePath, {
-    syncLockTimeoutMs: MIGRATION_LOCK_TIMEOUT_MS,
-  }).withLock((current) => {
-    if (current !== undefined) {
-      parseAccountsData(current);
-      return { result: "canonical" as const };
-    }
-    return { result: "migrated" as const, next: contents };
-  });
-}
-
-function validateCanonicalAccountsFile(filePath: string): void {
-  parseAccountsData(readPrivateRegularFile(filePath));
-}
-
-function enforcePrivateRegularFile(filePath: string): void {
-  readPrivateRegularFile(filePath);
-}
-
-function readPrivateRegularFile(filePath: string): string {
-  const info = lstatSync(filePath);
-  if (!info.isFile() || info.isSymbolicLink()) {
-    throw new Error(`Accounts path must be a regular file: ${filePath}`);
-  }
-  return readPrivateFileSync(filePath);
-}
-
-function pathEntryExists(filePath: string): boolean {
-  try {
-    lstatSync(filePath);
-    return true;
-  } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) return false;
-    throw error;
-  }
-}
-
-export function consumeMigrationNotice(): string | undefined {
-  const notice = pendingMigrationNotice;
-  pendingMigrationNotice = undefined;
-  return notice;
+  return new FileAccountStorageBackend(join(getAgentDir(), ACCOUNTS_FILE));
 }
 
 function emptyAccountsData(): AccountsData {
@@ -519,10 +352,6 @@ function isAccountProviderId(value: string): value is AccountProviderId {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return error instanceof Error && "code" in error && error.code === code;
 }
 
 export { InMemoryAccountStorageBackend };

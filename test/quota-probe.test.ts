@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { Model } from "@earendil-works/pi-ai";
-import { test } from "vitest";
+import { createJiti } from "jiti";
+import { afterAll, beforeAll, describe, test } from "vitest";
 import { OPENAI_QUOTA_MESSAGE } from "../src/quota-errors.js";
-import { runProbeProcess } from "../src/quota-probe.js";
+import { runProbeProcess as runSourceProbe } from "../src/quota-probe.js";
 
 const model: Model<"openai-responses"> = {
   id: "offline-fixture",
@@ -49,142 +53,168 @@ function pong(response: ServerResponse, text = "pong") {
   response.end(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
 }
 
-test("fresh headless Pi probe sends only ping, no tools/history, and verifies terminal pong", async () => {
-  let body: Record<string, unknown> | undefined;
-  let authorization: string | undefined;
-  let requests = 0;
-  await server(
-    (request, response) => {
-      requests++;
-      authorization = request.headers.authorization;
-      let text = "";
-      request.setEncoding("utf8");
-      request.on("data", (chunk: string) => {
-        text += chunk;
-      });
-      request.on("end", () => {
-        body = JSON.parse(text);
-        pong(response);
-      });
-    },
-    async (baseUrl) => {
-      assert.equal(
-        await runProbeProcess(
-          { ...model, baseUrl },
-          { apiKey: "offline-synthetic-access" },
-          new AbortController().signal,
-        ),
-        "pong",
-      );
-    },
-  );
-  assert.equal(requests, 1);
-  assert.equal(authorization, "Bearer offline-synthetic-access");
-  assert.ok(body);
-  assert.equal(body.model, model.id);
-  assert.equal(body.tools, undefined);
-  const input = JSON.stringify(body.input);
-  assert.match(input, /ping/);
-  assert.doesNotMatch(input, /AGENTS|PLAN|original conversation|powershell/);
-});
+describe.each(["source", "bundled"])("%s probe", (mode) => {
+  let runProbeProcess = runSourceProbe;
+  let root: string | undefined;
+  beforeAll(async () => {
+    if (mode === "source") return;
+    root = await mkdtemp(join(resolve("."), ".pi-accounts-build-test-probe-"));
+    // Exercise Node's node_modules TypeScript restriction, not only source execution.
+    const packageDirectory = join(root, "node_modules", "probe-fixture");
+    await mkdir(packageDirectory, { recursive: true });
+    await writeFile(join(packageDirectory, "package.json"), JSON.stringify({ type: "module" }));
+    const outputDirectory = join(packageDirectory, "dist");
+    const { buildRuntime } = await import(pathToFileURL(resolve("scripts/build-runtime.mjs")).href);
+    await buildRuntime({ outputDirectory });
+    const chunks = join(outputDirectory, "chunks");
+    const probe = (await readdir(chunks)).find((name) => /^quota-probe-.*\.ts$/u.test(name));
+    assert.ok(probe);
+    const loaded = await createJiti(import.meta.url, { fsCache: false, moduleCache: false, tryNative: false }).import<
+      typeof import("../src/quota-probe.js")
+    >(pathToFileURL(join(chunks, probe)).href);
+    runProbeProcess = loaded.runProbeProcess;
+  });
+  afterAll(async () => {
+    if (root) await rm(root, { recursive: true, force: true });
+  });
 
-test("probe accepts the exact message-only quota failure without retrying the request", async () => {
-  let requests = 0;
-  await server(
-    (_request, response) => {
-      requests++;
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(`event: error\ndata: ${JSON.stringify({ type: "error", message: OPENAI_QUOTA_MESSAGE })}\n\n`);
-    },
-    async (baseUrl) => {
-      assert.equal(
-        await runProbeProcess(
-          { ...model, baseUrl },
-          { apiKey: "offline-synthetic-access" },
-          new AbortController().signal,
-        ),
-        "quota",
-      );
-    },
-  );
-  assert.equal(requests, 1);
-});
-
-test("successful inference with the wrong reply is not verified pong", async () => {
-  await server(
-    (_request, response) => pong(response, "not pong"),
-    async (baseUrl) => {
-      await assert.rejects(
-        runProbeProcess({ ...model, baseUrl }, { apiKey: "offline-synthetic-access" }, new AbortController().signal),
-        /pong/,
-      );
-    },
-  );
-});
-
-for (const fixture of [
-  { status: 429, message: OPENAI_QUOTA_MESSAGE, expected: "quota" },
-  { status: 429, message: "Try again later", expected: "invalid" },
-  { status: 503, message: "Server unavailable secret-provider-body", expected: "invalid" },
-  { status: 401, message: "Bearer synthetic-access rt.synthetic-refresh", expected: "authentication" },
-]) {
-  test(`headless probe performs exactly one HTTP ${fixture.status} attempt for ${fixture.expected}`, async () => {
-    let calls = 0;
+  test("fresh headless Pi probe sends only ping, no tools/history, and verifies terminal pong", async () => {
+    let body: Record<string, unknown> | undefined;
+    let authorization: string | undefined;
+    let requests = 0;
     await server(
-      (_request, response) => {
-        calls++;
-        response.writeHead(fixture.status, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: fixture.message } }));
+      (request, response) => {
+        requests++;
+        authorization = request.headers.authorization;
+        let text = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        request.on("end", () => {
+          body = JSON.parse(text);
+          pong(response);
+        });
       },
       async (baseUrl) => {
-        const operation = runProbeProcess(
-          { ...model, baseUrl },
-          { apiKey: "offline-synthetic-token" },
-          new AbortController().signal,
+        assert.equal(
+          await runProbeProcess(
+            { ...model, baseUrl },
+            { apiKey: "offline-synthetic-access" },
+            new AbortController().signal,
+          ),
+          "pong",
         );
-        if (fixture.expected === "quota") assert.equal(await operation, "quota");
-        else
-          await assert.rejects(operation, (error: Error) => {
-            assert.match(error.message, fixture.expected === "authentication" ? /authentication/ : /non-quota/);
-            assert.doesNotMatch(error.message, /secret-provider-body|synthetic-access|synthetic-refresh/);
-            return true;
-          });
-        assert.equal(calls, 1);
+      },
+    );
+    assert.equal(requests, 1);
+    assert.equal(authorization, "Bearer offline-synthetic-access");
+    assert.ok(body);
+    assert.equal(body.model, model.id);
+    assert.equal(body.tools, undefined);
+    const input = JSON.stringify(body.input);
+    assert.match(input, /ping/);
+    assert.doesNotMatch(input, /AGENTS|PLAN|original conversation|powershell/);
+  });
+
+  test("probe accepts the exact message-only quota failure without retrying the request", async () => {
+    let requests = 0;
+    await server(
+      (_request, response) => {
+        requests++;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(`event: error\ndata: ${JSON.stringify({ type: "error", message: OPENAI_QUOTA_MESSAGE })}\n\n`);
+      },
+      async (baseUrl) => {
+        assert.equal(
+          await runProbeProcess(
+            { ...model, baseUrl },
+            { apiKey: "offline-synthetic-access" },
+            new AbortController().signal,
+          ),
+          "quota",
+        );
+      },
+    );
+    assert.equal(requests, 1);
+  });
+
+  test("successful inference with the wrong reply is not verified pong", async () => {
+    await server(
+      (_request, response) => pong(response, "not pong"),
+      async (baseUrl) => {
+        await assert.rejects(
+          runProbeProcess({ ...model, baseUrl }, { apiKey: "offline-synthetic-access" }, new AbortController().signal),
+          /pong/,
+        );
       },
     );
   });
-}
 
-test("a fresh probe rejects a contradictory SSE code despite SDK code loss", async () => {
-  await server(
-    (_request, response) => {
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(
-        `event: error\ndata: ${JSON.stringify({ type: "error", code: "invalid_api_key", message: OPENAI_QUOTA_MESSAGE })}\n\n`,
+  for (const fixture of [
+    { status: 429, message: OPENAI_QUOTA_MESSAGE, expected: "quota" },
+    { status: 429, message: "Try again later", expected: "invalid" },
+    { status: 503, message: "Server unavailable secret-provider-body", expected: "invalid" },
+    { status: 401, message: "Bearer synthetic-access rt.synthetic-refresh", expected: "authentication" },
+  ]) {
+    test(`headless probe performs exactly one HTTP ${fixture.status} attempt for ${fixture.expected}`, async () => {
+      let calls = 0;
+      await server(
+        (_request, response) => {
+          calls++;
+          response.writeHead(fixture.status, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { message: fixture.message } }));
+        },
+        async (baseUrl) => {
+          const operation = runProbeProcess(
+            { ...model, baseUrl },
+            { apiKey: "offline-synthetic-token" },
+            new AbortController().signal,
+          );
+          if (fixture.expected === "quota") assert.equal(await operation, "quota");
+          else
+            await assert.rejects(operation, (error: Error) => {
+              assert.match(error.message, fixture.expected === "authentication" ? /authentication/ : /non-quota/);
+              assert.doesNotMatch(error.message, /secret-provider-body|synthetic-access|synthetic-refresh/);
+              return true;
+            });
+          assert.equal(calls, 1);
+        },
       );
-    },
-    async (baseUrl) => {
-      await assert.rejects(
-        runProbeProcess({ ...model, baseUrl }, { apiKey: "offline-synthetic" }, new AbortController().signal),
-        /non-quota/,
-      );
-    },
-  );
-});
+    });
+  }
 
-test("cancelling a live probe kills its owned child and releases the operation", async () => {
-  const controller = new AbortController();
-  await server(
-    (_request, response) => {
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.flushHeaders();
-      controller.abort();
-    },
-    async (baseUrl) => {
-      await assert.rejects(
-        runProbeProcess({ ...model, baseUrl }, { apiKey: "offline-synthetic-access" }, controller.signal),
-        /cancelled/,
-      );
-    },
-  );
+  test("a fresh probe rejects a contradictory SSE code despite SDK code loss", async () => {
+    await server(
+      (_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(
+          `event: error\ndata: ${JSON.stringify({ type: "error", code: "invalid_api_key", message: OPENAI_QUOTA_MESSAGE })}\n\n`,
+        );
+      },
+      async (baseUrl) => {
+        await assert.rejects(
+          runProbeProcess({ ...model, baseUrl }, { apiKey: "offline-synthetic" }, new AbortController().signal),
+          /non-quota/,
+        );
+      },
+    );
+  });
+
+  test("cancelling a live probe kills its owned child and releases the operation", async () => {
+    const controller = new AbortController();
+    await server(
+      (_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.flushHeaders();
+        controller.abort();
+      },
+      async (baseUrl) => {
+        await assert.rejects(
+          runProbeProcess({ ...model, baseUrl }, { apiKey: "offline-synthetic-access" }, controller.signal),
+          /cancelled/,
+        );
+      },
+    );
+  });
 });

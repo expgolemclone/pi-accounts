@@ -41,7 +41,6 @@ export type AccountProviderAdapter = {
   runtimeAuthMode: "api-key" | "authorization-header";
   refreshModelCatalogAfterAuth?: boolean;
   resolveOAuth?: (ctx: Pick<ExtensionContext, "modelRegistry">) => ProviderOwnedOAuth;
-  defaultModelId?: string;
   invalidateConnections?: (sessionId?: string) => unknown | Promise<unknown>;
 };
 
@@ -84,7 +83,6 @@ export function createBuiltinProviderAdapters(
       displayName: "OpenAI Codex",
       requiresApiKeyBridge: true,
       runtimeAuthMode: "api-key",
-      defaultModelId: "gpt-5.5",
       invalidateConnections: options.closeCodexWebSockets ?? cleanupSessionResources,
       oauth: createLazyProviderOwnedOAuth("openai-codex", loader),
     },

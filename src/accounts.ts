@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createAccountActivation } from "./account-activation.js";
-import type { PersistSelection, SessionSelectionOwner, SyncProvider } from "./account-session.js";
+import { type AccountActivationOutcome, type ActivateAccount, createAccountActivation } from "./account-activation.js";
+import {
+  type PersistSelection,
+  type ProviderSessionState,
+  SessionSelectionOwner,
+  type SyncProvider,
+} from "./account-session.js";
 import {
   AccountStore,
-  consumeMigrationNotice,
   defineOwn,
   defineOwnMap,
   getOwnCredential,
@@ -52,8 +56,6 @@ export {
   AccountStore,
   type AccountsData,
   InMemoryAccountStorageBackend,
-  LEGACY_CODEX_ACCOUNTS_FILE,
-  migrateLegacyCodexAccountsFile,
   type ProviderAccountsData,
   parseAccountName,
   parseAccountsData,
@@ -79,7 +81,6 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
   const sharedSelection = new OpenAISelection(store);
   const recovery = new QuotaRecovery(store, sharedSelection, dependencies.recoveryBackend);
   let openaiRequests: OpenAIRequests | undefined;
-  let migrationNotice = dependencies.store ? undefined : consumeMigrationNotice();
   const providers = [
     ...(dependencies.providers ??
       createBuiltinProviderAdapters({ closeCodexWebSockets: dependencies.closeCodexWebSockets })),
@@ -96,7 +97,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
         const owner = sessionOwners.get(request.session as ExtensionContext["sessionManager"]);
         const providerId = toProviderId(request.provider);
         if (!owner || !providerId) return;
-        owner.coordinators.get(providerId)?.offerCredential(data);
+        owner.providers.get(providerId)?.coordinator.offerCredential(data);
       },
     },
   ]);
@@ -155,56 +156,24 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     const previous = sessionOwners.get(ctx.sessionManager);
     if (previous) {
       openaiRequests?.cancel(previous.context);
-      previous.controller.abort(new DOMException("Accounts session replaced", "AbortError"));
-      previous.results.clear();
-      previous.selectionRevisions.clear();
-      previous.activationRequests.clear();
-      previous.appliedIdentities.clear();
-      previous.abortProviders.clear();
-      previous.syncTasks.clear();
-      previous.pendingSyncTasks.clear();
-      previous.startupTasks.clear();
-      previous.startupCompletedProviders.clear();
-      for (const coordinator of previous.coordinators.values()) coordinator.invalidate(ctx);
+      void previous.dispose(ctx);
     }
-    const controller = new AbortController();
     const environment = readEnvironmentAccount();
-    const owner: SessionSelectionOwner = {
-      context: ctx,
-      // Pi exposes this as read-only to extensions, but the runtime context contains the concrete
-      // session manager. Factory-bound pi.appendEntry() cannot target concurrent session owners.
-      sessionManager: ctx.sessionManager as SessionSelectionOwner["sessionManager"],
-      sessionId: ctx.sessionManager.getSessionId(),
-      selections: cloneAccountSelections(Object.create(null) as ProviderAccountSelections),
-      environmentAccount: environment.account,
-      environmentError: environment.error,
-      selectionRevisions: new Map(),
-      activationRequests: new Map(),
-      controller,
-      signal: controller.signal,
-      ready: Promise.resolve(),
-      coordinators: new Map(
-        providers.map((provider) => [
-          provider.id,
+    const owner = new SessionSelectionOwner(
+      ctx,
+      providers.map(
+        (provider) =>
           new RuntimeAuthCoordinator(
-            pi,
             provider,
             RUNTIME_FAIL_CLOSED_API_KEY,
             provider.id === "openai"
               ? (ctx, name, credential, signal) => openaiRequests?.wrap(ctx, name, credential, signal)
               : undefined,
           ),
-        ]),
       ),
-      results: new Map(),
-      appliedIdentities: new Map(),
-      abortProviders: new Set(),
-      syncTasks: new Map(),
-      pendingSyncTasks: new Map(),
-      startupTask: Promise.resolve(),
-      startupTasks: new Map(),
-      startupCompletedProviders: new Set(),
-    };
+      environment.account,
+      environment.error,
+    );
     sessionOwners.set(ctx.sessionManager, owner);
     if (owner.environmentError) ctx.ui.notify(owner.environmentError, "error");
     owner.ready = initializeOwner(owner, ctx);
@@ -224,6 +193,8 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     if (!isOwnerCurrent(owner) || !isCurrent() || owner.environmentAccount !== undefined || owner.environmentError) {
       return false;
     }
+    const provider = owner.providers.get(providerId);
+    if (!provider) return false;
     if (providerId === "openai") {
       const published = await sharedSelection.select(
         accountName,
@@ -232,7 +203,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
       );
       if (!published || !isOwnerCurrent(owner) || !isCurrent()) return false;
       openaiRequests?.cancel(owner.context, true);
-      owner.selectionRevisions.set(providerId, (owner.selectionRevisions.get(providerId) ?? 0) + 1);
+      provider.selectionRevision++;
       return true;
     }
     let selections = owner.error
@@ -248,7 +219,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     );
     if (!isOwnerCurrent(owner) || !isCurrent()) return false;
     owner.selections = selections;
-    owner.selectionRevisions.set(providerId, (owner.selectionRevisions.get(providerId) ?? 0) + 1);
+    provider.selectionRevision++;
     owner.error = undefined;
     return true;
   };
@@ -259,12 +230,15 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
   });
 
   const syncProvider: SyncProvider = (providerId, ctx, owner, ownerSignal, model = ctx.model) => {
+    const provider = owner.providers.get(providerId);
+    if (!provider || !isOwnerCurrent(owner)) return Promise.resolve(staleResult(providerId));
+    const adapter = requireAdapter(adapters, providerId);
+    const { coordinator } = provider;
     let task!: Promise<EnsureActiveProviderAuthResult>;
+    const current = () => isOwnerCurrent(owner) && provider.syncTask === task;
+    const replacement = () =>
+      provider.syncTask && provider.syncTask !== task ? provider.syncTask : staleResult(providerId);
     task = (async () => {
-      const adapter = requireAdapter(adapters, providerId);
-      const coordinator = owner.coordinators.get(providerId);
-      if (!coordinator) throw new Error(`Missing runtime coordinator for ${providerId}.`);
-      if (!isOwnerCurrent(owner)) return staleResult(providerId);
       const signal = ownerSignal ? AbortSignal.any([owner.signal, ownerSignal]) : owner.signal;
       let selectionError = owner.environmentError ?? (owner.environmentAccount === undefined ? owner.error : undefined);
       let selectedAccount = owner.environmentAccount ?? owner.selections[providerId] ?? null;
@@ -274,7 +248,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
           if (hasEnvironmentSelection(owner))
             throw new Error("Shared OpenAI account selection requires PI_ACCOUNT to be unset.");
           const shared = await sharedSelection.ensure(signal);
-          if (!isOwnerCurrent(owner)) return staleResult(providerId);
+          if (!current()) return replacement();
           selectedAccount = shared.account;
           sharedRevision = shared.revision;
           selectionError = undefined;
@@ -285,34 +259,24 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
       let result = selectionError
         ? await coordinator.forceFailClosed(ctx, "unknown", new Error(selectionError))
         : await coordinator.ensureActive(ctx, store, selectedAccount, Date.now(), signal);
-      if (providerId === "openai" && sharedRevision && result.status !== "error" && isOwnerCurrent(owner)) {
+      if (providerId === "openai" && sharedRevision && result.status !== "error" && current()) {
         const latestShared = readSharedSelection(await store.readProviderAsync("openai", signal));
         if (latestShared?.revision !== sharedRevision) return syncProvider(providerId, ctx, owner, ownerSignal, model);
       }
       let identity: string | undefined;
-      let latest = owner.syncTasks.get(providerId);
-      if (!isOwnerCurrent(owner)) return latest && latest !== task ? latest : staleResult(providerId);
-      if (latest && latest !== task) return latest;
+      if (!current()) return replacement();
       try {
         identity = coordinator.getAppliedAuthIdentity(ctx, result);
-        const previousIdentity = owner.appliedIdentities.get(providerId);
-        const shouldInvalidate =
-          previousIdentity !== identity && !(previousIdentity === undefined && identity === "default");
-        if (shouldInvalidate) {
+        const previousIdentity = provider.appliedIdentity;
+        if (previousIdentity !== identity && !(previousIdentity === undefined && identity === "default")) {
           await adapter.invalidateConnections?.(owner.sessionId);
-          latest = owner.syncTasks.get(providerId);
-          if (!isOwnerCurrent(owner)) return latest && latest !== task ? latest : staleResult(providerId);
-          if (latest && latest !== task) return latest;
+          if (!current()) return replacement();
         }
-        owner.appliedIdentities.set(providerId, identity);
+        provider.appliedIdentity = identity;
       } catch (error) {
-        latest = owner.syncTasks.get(providerId);
-        if (!isOwnerCurrent(owner)) return latest && latest !== task ? latest : staleResult(providerId);
-        if (latest && latest !== task) return latest;
+        if (!current()) return replacement();
         const credential = await selectedCredential(store, providerId, result, signal);
-        latest = owner.syncTasks.get(providerId);
-        if (!isOwnerCurrent(owner)) return latest && latest !== task ? latest : staleResult(providerId);
-        if (latest && latest !== task) return latest;
+        if (!current()) return replacement();
         result = await coordinator.forceFailClosed(
           ctx,
           result.status === "inactive" ? "unknown" : result.accountName,
@@ -320,19 +284,16 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
           credential,
         );
       }
-      latest = owner.syncTasks.get(providerId);
-      if (!isOwnerCurrent(owner)) return latest && latest !== task ? latest : staleResult(providerId);
-      if (latest && latest !== task) return latest;
+      if (!current()) return replacement();
       coordinator.publishCredentialOffer(ctx, result, identity ?? "");
-      owner.results.set(providerId, result);
-      updateStatus(ctx, owner.results, model, hasEnvironmentSelection(owner));
+      provider.result = result;
+      updateStatus(ctx, owner.providers, model, hasEnvironmentSelection(owner));
       return result;
     })();
-    owner.syncTasks.set(providerId, task);
-    owner.pendingSyncTasks.set(providerId, task);
+    provider.syncTask = task;
+    provider.pendingSync = task;
     const clearPending = () => {
-      if (!isOwnerCurrent(owner) || owner.pendingSyncTasks.get(providerId) !== task) return;
-      owner.pendingSyncTasks.delete(providerId);
+      if (provider.pendingSync === task) provider.pendingSync = undefined;
     };
     void task.then(clearPending, clearPending);
     return task;
@@ -343,18 +304,16 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     ctx: ExtensionContext,
     owner: SessionSelectionOwner,
   ): Promise<EnsureActiveProviderAuthResult> => {
-    if (owner.startupCompletedProviders.has(providerId)) {
-      return Promise.resolve(owner.results.get(providerId) ?? staleResult(providerId));
-    }
-    const existing = owner.startupTasks.get(providerId);
-    if (existing) return existing;
-    let task!: Promise<EnsureActiveProviderAuthResult>;
-    task = syncProvider(providerId, ctx, owner).finally(() => {
-      if (!isOwnerCurrent(owner) || owner.startupTasks.get(providerId) !== task) return;
-      owner.startupTasks.delete(providerId);
-      owner.startupCompletedProviders.add(providerId);
+    const provider = owner.providers.get(providerId);
+    if (!provider) return Promise.resolve(staleResult(providerId));
+    if (provider.started) return Promise.resolve(provider.result ?? staleResult(providerId));
+    if (provider.startupTask) return provider.startupTask;
+    const task = syncProvider(providerId, ctx, owner).finally(() => {
+      if (!isOwnerCurrent(owner) || provider.startupTask !== task) return;
+      provider.startupTask = undefined;
+      provider.started = true;
     });
-    owner.startupTasks.set(providerId, task);
+    provider.startupTask = task;
     return task;
   };
 
@@ -372,18 +331,19 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
         );
       }
     }
-    if (isOwnerCurrent(owner)) updateStatus(ctx, owner.results, ctx.model, hasEnvironmentSelection(owner));
+    if (isOwnerCurrent(owner)) updateStatus(ctx, owner.providers, ctx.model, hasEnvironmentSelection(owner));
   };
 
   const waitForCurrentProvider = async (providerId: AccountProviderId, owner: SessionSelectionOwner): Promise<void> => {
     await owner.ready;
     if (!isOwnerCurrent(owner)) return;
-    let pending = owner.pendingSyncTasks.get(providerId);
-    if (!pending) {
-      pending = owner.startupCompletedProviders.has(providerId)
+    const provider = owner.providers.get(providerId);
+    if (!provider) return;
+    let pending =
+      provider.pendingSync ??
+      (provider.started
         ? syncProvider(providerId, owner.context, owner)
-        : startupProvider(providerId, owner.context, owner);
-    }
+        : startupProvider(providerId, owner.context, owner));
     while (true) {
       let rejected = false;
       let failure: unknown;
@@ -394,7 +354,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
         failure = error;
       }
       if (!isOwnerCurrent(owner)) return;
-      const latest = owner.syncTasks.get(providerId);
+      const latest = provider.syncTask;
       if (latest && latest !== pending) {
         pending = latest;
         continue;
@@ -405,7 +365,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
   };
 
   const startBackgroundSync = (ctx: ExtensionContext, owner: SessionSelectionOwner): void => {
-    owner.startupTask = (async () => {
+    void (async () => {
       try {
         await owner.ready;
         if (!isOwnerCurrent(owner)) return;
@@ -494,6 +454,15 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     },
   ]);
 
+  const activateAccount = createAccountActivation(
+    store,
+    adapters,
+    (session) => sessionOwners.get(session as ExtensionContext["sessionManager"]),
+    isOwnerCurrent,
+    persistSelection,
+    syncProvider,
+  );
+
   registerAccountsProtocol(
     pi,
     async () => {
@@ -513,19 +482,21 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
         }),
       };
     },
-    createAccountActivation(
-      store,
-      adapters,
-      (session) => sessionOwners.get(session as ExtensionContext["sessionManager"]),
-      isOwnerCurrent,
-      persistSelection,
-      syncProvider,
-    ),
+    async (request) => {
+      const result = await activateAccount(request);
+      if (result.status !== "error") return result;
+      return {
+        status: result.status,
+        providerId: result.providerId,
+        accountName: result.accountName,
+        code: result.code,
+      };
+    },
   );
 
   pi.registerCommand(
     "accounts",
-    createAccountCommand(store, adapters, syncProvider, persistSelection, ensureSessionOwner, (owner) => ({
+    createAccountCommand(store, adapters, syncProvider, activateAccount, ensureSessionOwner, (owner) => ({
       signal: owner.signal,
       isCurrent: () => isOwnerCurrent(owner),
     })),
@@ -533,10 +504,6 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
 
   pi.on("session_start", (_event, ctx) => {
     const owner = startSessionOwner(ctx);
-    if (migrationNotice) {
-      ctx.ui.notify(migrationNotice, "warning");
-      migrationNotice = undefined;
-    }
     startBackgroundSync(ctx, owner);
   });
 
@@ -552,7 +519,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
           "error",
         );
       }
-    } else updateStatus(ctx, owner.results, event.model, hasEnvironmentSelection(owner));
+    } else updateStatus(ctx, owner.providers, event.model, hasEnvironmentSelection(owner));
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -560,19 +527,21 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     // proceeds under the replacement and must not acquire an extra continue.
     openaiRequests?.cancel(ctx);
     const owner = await ensureSessionOwner(ctx);
-    owner.abortProviders.clear();
+    for (const provider of owner.providers.values()) provider.abortTurn = false;
     if (!isOwnerCurrent(owner)) return;
     const providerId = toProviderId(ctx.model?.provider);
     if (!providerId) return;
     try {
-      const result = owner.startupCompletedProviders.has(providerId)
+      const result = owner.providers.get(providerId)?.started
         ? await syncProvider(providerId, ctx, owner)
         : await startupProvider(providerId, ctx, owner);
       if (!isOwnerCurrent(owner)) return;
-      const coordinator = owner.coordinators.get(providerId);
-      if (result.status === "error") owner.abortProviders.add(providerId);
-      if (result.status === "active" && ctx.model && coordinator && !coordinator.isModelAvailable(ctx.model.id)) {
-        owner.abortProviders.add(providerId);
+      const provider = owner.providers.get(providerId);
+      if (!provider) return;
+      const { coordinator } = provider;
+      if (result.status === "error") provider.abortTurn = true;
+      if (result.status === "active" && ctx.model && !coordinator.isModelAvailable(ctx.model.id)) {
+        provider.abortTurn = true;
         ctx.ui.notify(
           hasEnvironmentSelection(owner)
             ? `${requireAdapter(adapters, providerId).displayName} model ${ctx.model.id} is not available to the account selected by PI_ACCOUNT.`
@@ -581,7 +550,8 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
         );
       }
     } catch (error) {
-      owner.abortProviders.add(providerId);
+      const provider = owner.providers.get(providerId);
+      if (provider) provider.abortTurn = true;
       throw error;
     }
   });
@@ -590,8 +560,9 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     const owner = sessionOwners.get(ctx.sessionManager);
     if (!owner || !isOwnerCurrent(owner)) return;
     const providerId = toProviderId(ctx.model?.provider);
-    if (!providerId || !owner.abortProviders.has(providerId)) return;
-    owner.abortProviders.delete(providerId);
+    const provider = providerId ? owner.providers.get(providerId) : undefined;
+    if (!provider?.abortTurn) return;
+    provider.abortTurn = false;
     ctx.abort();
   });
 
@@ -603,22 +574,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     }
     sessionOwners.delete(ctx.sessionManager);
     openaiRequests?.dispose(ctx);
-    owner.controller.abort(new DOMException("Accounts session shut down", "AbortError"));
-    owner.results.clear();
-    owner.selectionRevisions.clear();
-    owner.activationRequests.clear();
-    owner.appliedIdentities.clear();
-    owner.abortProviders.clear();
-    owner.syncTasks.clear();
-    owner.pendingSyncTasks.clear();
-    owner.startupTasks.clear();
-    owner.startupCompletedProviders.clear();
-    await Promise.allSettled(
-      [...owner.coordinators.values()].map(async (coordinator) => {
-        coordinator.invalidate(ctx, false);
-        await coordinator.clear(ctx, true);
-      }),
-    );
+    await owner.dispose(ctx, true);
     setStatus(ctx, undefined);
   });
 }
@@ -627,7 +583,7 @@ function createAccountCommand(
   store: AccountStore,
   adapters: Map<AccountProviderId, AccountProviderAdapter>,
   syncProvider: SyncProvider,
-  persistSelection: PersistSelection,
+  activateAccount: ActivateAccount,
   ensureSessionOwner: (ctx: ExtensionContext) => Promise<SessionSelectionOwner>,
   getMenuOwner: (owner: SessionSelectionOwner) => { signal: AbortSignal; isCurrent(): boolean },
 ) {
@@ -646,11 +602,11 @@ function createAccountCommand(
         owner,
         {
           login: (adapter, name, signal, isCurrent, method) =>
-            loginAccount(ctx, store, adapter, name, signal, syncProvider, persistSelection, owner, isCurrent, method),
+            loginAccount(ctx, store, adapter, name, signal, syncProvider, activateAccount, owner, isCurrent, method),
           switch: (adapter, name, signal, isCurrent) =>
-            switchAccount(ctx, store, adapter, name, signal, syncProvider, persistSelection, owner, isCurrent),
+            switchAccount(ctx, adapter, name, signal, activateAccount, owner, isCurrent),
           remove: (adapter, name, signal, isCurrent) =>
-            removeAccount(ctx, store, adapter, name, signal, syncProvider, persistSelection, owner, isCurrent),
+            removeAccount(ctx, store, adapter, name, signal, syncProvider, activateAccount, owner, isCurrent),
         },
         menuOwner,
       );
@@ -665,7 +621,7 @@ async function loginAccount(
   nameArg: string,
   signal: AbortSignal,
   syncProvider: SyncProvider,
-  persistSelection: PersistSelection,
+  activateAccount: ActivateAccount,
   session: SessionSelectionOwner,
   isCurrent: () => boolean,
   method: "oauth" | "api_key" = "oauth",
@@ -714,9 +670,15 @@ async function loginAccount(
     );
     if (!isCurrent()) return;
     credentialSaved = true;
-    if (!hasEnvironmentSelection(session) && !(await persistSelection(session, adapter.id, parsed.name, isCurrent)))
-      return;
-    const result = await syncProvider(adapter.id, ctx, session, signal);
+    const result = hasEnvironmentSelection(session)
+      ? await syncProvider(adapter.id, ctx, session, signal)
+      : await activateAccount({
+          session: session.sessionManager,
+          provider: adapter.id,
+          account: parsed.name,
+          signal,
+          isCurrent,
+        });
     if (!isCurrent()) return;
     ctx.ui.notify(
       hasEnvironmentSelection(session)
@@ -738,75 +700,43 @@ async function loginAccount(
 
 async function switchAccount(
   ctx: ExtensionCommandContext,
-  store: AccountStore,
   adapter: AccountProviderAdapter,
-  nameArg: string,
+  name: string,
   signal: AbortSignal,
-  syncProvider: SyncProvider,
-  persistSelection: PersistSelection,
+  activateAccount: ActivateAccount,
   session: SessionSelectionOwner,
   isCurrent: () => boolean,
 ): Promise<void> {
   if (!isCurrent()) return;
-  if (hasEnvironmentSelection(session)) {
-    ctx.ui.notify(
-      "PI_ACCOUNT controls this process's account selection. Unset it and restart Pi to switch accounts.",
-      "warning",
-    );
-    return;
-  }
-  const name = nameArg.trim();
-  if (!name) {
-    ctx.ui.notify(`Select a ${adapter.displayName} account from /accounts.`, "warning");
-    return;
-  }
-  if (isDefaultPiLoginArg(name)) {
-    try {
-      if (!(await persistSelection(session, adapter.id, null, isCurrent))) return;
-    } catch (error) {
-      if (!isCurrent()) return;
-      ctx.ui.notify(
-        `Could not save the default ${adapter.displayName} selection for this session: ${redactTokenText(errorMessage(error))}`,
-        "error",
-      );
-      return;
-    }
-    const result = await syncProvider(adapter.id, ctx, session, signal);
-    if (!isCurrent()) return;
-    if (result.status === "error") {
-      ctx.ui.notify(
-        `Could not restore default Pi ${adapter.displayName} login; requests will fail closed: ${result.message}`,
-        "error",
-      );
-      return;
-    }
-    ctx.ui.notify(`Using default Pi ${adapter.displayName} login.`, "info");
-    return;
-  }
-  const parsed = parseAccountName(name);
-  if (!parsed.ok) return ctx.ui.notify(parsed.error, "warning");
-  const state = await store.readProviderAsync(adapter.id);
+  const account = name === "default" ? null : name;
+  const result = await activateAccount({
+    session: session.sessionManager,
+    provider: adapter.id,
+    account,
+    signal,
+    isCurrent,
+  });
   if (!isCurrent()) return;
-  if (!getOwnCredential(state.accounts, parsed.name)) {
-    ctx.ui.notify(`${adapter.displayName} account "${parsed.name}" was not found.`, "warning");
-    return;
-  }
-  try {
-    if (!(await persistSelection(session, adapter.id, parsed.name, isCurrent))) return;
-  } catch (error) {
-    if (!isCurrent()) return;
+  if (result.status === "error" && result.code === "account_not_found") {
+    ctx.ui.notify(`${adapter.displayName} account "${name}" was not found.`, "warning");
+  } else if (result.status === "error" && result.code === "store_unavailable") {
     ctx.ui.notify(
-      `Could not save ${adapter.displayName} account "${parsed.name}" for this session: ${redactTokenText(errorMessage(error))}`,
+      `Could not save ${adapter.displayName} selection for this session: ${result.message ?? result.code}`,
       "error",
     );
-    return;
+  } else if (account === null && result.status === "inactive") {
+    ctx.ui.notify(`Using default Pi ${adapter.displayName} login.`, "info");
+  } else if (account === null && result.status === "error" && result.code !== "activation_superseded") {
+    ctx.ui.notify(
+      `Could not restore default Pi ${adapter.displayName} login; requests will fail closed: ${result.message ?? result.code}`,
+      "error",
+    );
+  } else {
+    ctx.ui.notify(
+      formatActivationMessage("Activated", adapter, name, result),
+      result.status === "active" ? "info" : "error",
+    );
   }
-  const result = await syncProvider(adapter.id, ctx, session, signal);
-  if (!isCurrent()) return;
-  ctx.ui.notify(
-    formatActivationMessage("Activated", adapter, parsed.name, result),
-    result.status === "active" ? "info" : "error",
-  );
 }
 
 async function removeAccount(
@@ -816,7 +746,7 @@ async function removeAccount(
   nameArg: string,
   signal: AbortSignal,
   syncProvider: SyncProvider,
-  persistSelection: PersistSelection,
+  activateAccount: ActivateAccount,
   session: SessionSelectionOwner,
   isCurrent: () => boolean,
 ): Promise<void> {
@@ -867,19 +797,27 @@ async function removeAccount(
   const removedSelection =
     adapter.id === "openai" ? removedSharedSelection : !session.error && session.selections[adapter.id] === parsed.name;
   if (removedSelection) {
-    try {
-      if (adapter.id !== "openai" && !(await persistSelection(session, adapter.id, null, isCurrent))) return;
-    } catch (error) {
-      if (!isCurrent()) return;
-      const result = await syncProvider(adapter.id, ctx, session, signal);
-      if (!isCurrent()) return;
-      ctx.ui.notify(
-        `Removed ${adapter.displayName} account "${parsed.name}", but this session could not save its default selection and will fail closed: ${redactTokenText(errorMessage(error))}${result.status === "error" ? ` (${result.message})` : ""}`,
-        "error",
-      );
+    // OpenAI deletion already atomically replaced its shared selection under the store lock.
+    // Reconcile that selection instead of publishing over another process's newer choice.
+    const result =
+      adapter.id === "openai"
+        ? await syncProvider(adapter.id, ctx, session, signal)
+        : await activateAccount({
+            session: session.sessionManager,
+            provider: adapter.id,
+            account: null,
+            signal,
+            isCurrent,
+          });
+    if (result.status === "error" && result.code === "store_unavailable") {
+      await syncProvider(adapter.id, ctx, session, signal);
+      if (isCurrent())
+        ctx.ui.notify(
+          `Removed ${adapter.displayName} account "${parsed.name}", but this session could not save its default selection and will fail closed: ${result.message}`,
+          "error",
+        );
       return;
     }
-    const result = await syncProvider(adapter.id, ctx, session, signal);
     if (!isCurrent()) return;
     if (result.status === "error") {
       ctx.ui.notify(
@@ -930,13 +868,16 @@ function formatActivationMessage(
   action: "Logged in" | "Activated",
   adapter: AccountProviderAdapter,
   name: string,
-  result: EnsureActiveProviderAuthResult,
+  result: EnsureActiveProviderAuthResult | AccountActivationOutcome,
 ): string {
+  if (result.status === "error" && result.code === "activation_superseded") {
+    return `${action} ${adapter.displayName} account "${name}" was superseded before activation.`;
+  }
   if (result.status !== "inactive" && result.accountName !== "unknown" && result.accountName !== name) {
     return `${action} ${adapter.displayName} account "${name}" was superseded by "${result.accountName}" before activation.`;
   }
   if (result.status === "error") {
-    return `${action} ${adapter.displayName} account "${name}", but authentication failed; requests will fail closed: ${result.message}`;
+    return `${action} ${adapter.displayName} account "${name}", but authentication failed; requests will fail closed: ${result.message ?? result.code ?? "activation_failed"}`;
   }
   if (result.status === "inactive") {
     return `${action} ${adapter.displayName} account "${name}" was superseded before activation.`;
@@ -961,12 +902,12 @@ async function selectedCredential(
 
 function updateStatus(
   ctx: ExtensionContext,
-  results: Map<AccountProviderId, EnsureActiveProviderAuthResult>,
+  providers: ReadonlyMap<AccountProviderId, ProviderSessionState>,
   model = ctx.model,
   fromEnvironment = false,
 ): void {
   const providerId = toProviderId(model?.provider);
-  const result = providerId ? results.get(providerId) : undefined;
+  const result = providerId ? providers.get(providerId)?.result : undefined;
   if (!result || result.status === "inactive") {
     setStatus(ctx, undefined);
     return;

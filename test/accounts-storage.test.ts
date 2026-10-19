@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { test } from "vitest";
-import { ACCOUNTS_FILE, AccountStore, migrateLegacyCodexAccountsFile, parseAccountsData } from "../src/accounts.js";
+import { ACCOUNTS_FILE, AccountStore, parseAccountsData } from "../src/accounts.js";
 import { FileAccountStorageBackend, InMemoryAccountStorageBackend } from "../src/storage.js";
+import { isolateAccountEnvironment } from "./isolate-account-environment.js";
 import { assertPrivateFile, weakenFilePermissions } from "./private-permissions.js";
+
+isolateAccountEnvironment();
 
 const credential = (suffix: string, extra: Record<string, unknown> = {}) => ({
   type: "oauth" as const,
@@ -530,110 +533,24 @@ test("file storage repairs weakened credential permissions on every read", async
   }
 });
 
-test("migration copies released Codex schema into provider state and retains rollback source", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-accounts-migrate-"));
-  const legacy = join(dir, "pi-codex-accounts.json");
-  const canonical = join(dir, ACCOUNTS_FILE);
+test("default store uses only the canonical file and leaves legacy credentials untouched", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-accounts-canonical-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  const legacyFiles = ["pi-codex-accounts.json", "codex-accounts.json"];
+  const raw = JSON.stringify({ active: "old", accounts: { old: credential("old") } });
   try {
-    await writeFile(
-      legacy,
-      JSON.stringify({
-        active: "work",
-        accounts: { work: credential("work", { accountId: "acct" }) },
-      }),
-      { mode: 0o644 },
-    );
-    const result = await migrateLegacyCodexAccountsFile(legacy, canonical);
-
-    assert.equal(result.status, "migrated");
-    assertPrivateFile(legacy);
-    assertPrivateFile(canonical);
-    assert.ok((await readFile(legacy, "utf8")).includes("access-work"));
-    const migrated = parseAccountsData(await readFile(canonical, "utf8"));
-    assert.equal(migrated.providers["openai-codex"]?.active, "work");
-    assert.equal(migrated.providers["openai-codex"]?.accounts.work?.accountId, "acct");
+    for (const name of legacyFiles) await writeFile(join(dir, name), raw, { mode: 0o600 });
+    const store = new AccountStore();
+    assert.deepEqual(Object.keys((await store.readAsync()).providers), []);
+    await assert.rejects(readFile(join(dir, ACCOUNTS_FILE)), /ENOENT/);
+    await store.updateProvider("anthropic", () => ({ accounts: { work: credential("work") } }));
+    assert.equal((await new AccountStore().readAsync()).providers.anthropic?.accounts.work?.access, "access-work");
+    assertPrivateFile(join(dir, ACCOUNTS_FILE));
+    for (const name of legacyFiles) assert.equal(await readFile(join(dir, name), "utf8"), raw);
   } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("concurrent migrations serialize and install one complete canonical file", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-accounts-concurrent-migration-"));
-  const legacy = join(dir, "pi-codex-accounts.json");
-  const canonical = join(dir, ACCOUNTS_FILE);
-  try {
-    await writeFile(legacy, JSON.stringify({ active: "work", accounts: { work: credential("work") } }), {
-      mode: 0o600,
-    });
-    const results = await Promise.all([
-      migrateLegacyCodexAccountsFile(legacy, canonical),
-      migrateLegacyCodexAccountsFile(legacy, canonical),
-    ]);
-    assert.deepEqual(results.map((result) => result.status).sort(), ["canonical", "migrated"]);
-    assert.equal(parseAccountsData(await readFile(canonical, "utf8")).providers["openai-codex"]?.active, "work");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("migration recovers from stale interrupted temporary files", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-accounts-interrupted-migration-"));
-  const legacy = join(dir, "pi-codex-accounts.json");
-  const canonical = join(dir, ACCOUNTS_FILE);
-  const staleTemp = join(dir, `.${ACCOUNTS_FILE}.interrupted.tmp`);
-  try {
-    await writeFile(legacy, JSON.stringify({ active: "work", accounts: { work: credential("work") } }), {
-      mode: 0o600,
-    });
-    await writeFile(staleTemp, "partial secret", { mode: 0o600 });
-    const old = new Date(Date.now() - 60_000);
-    await utimes(staleTemp, old, old);
-
-    assert.equal((await migrateLegacyCodexAccountsFile(legacy, canonical)).status, "migrated");
-    await assert.rejects(lstat(staleTemp), /ENOENT/);
-    assert.equal(parseAccountsData(await readFile(canonical, "utf8")).providers["openai-codex"]?.active, "work");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("migration rejects symlink credential paths without changing their targets", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-accounts-symlink-"));
-  const target = join(dir, "target.json");
-  const legacy = join(dir, "pi-codex-accounts.json");
-  const canonical = join(dir, ACCOUNTS_FILE);
-  try {
-    await writeFile(target, JSON.stringify({ active: "old", accounts: { old: credential("old") } }));
-    await symlink(
-      process.platform === "win32" ? dir : target,
-      legacy,
-      process.platform === "win32" ? "junction" : "file",
-    );
-    await assert.rejects(migrateLegacyCodexAccountsFile(legacy, canonical), /regular file/);
-    assert.ok((await readFile(target, "utf8")).includes("access-old"));
-    await assert.rejects(readFile(canonical, "utf8"), /ENOENT/);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("migration gives an existing canonical file precedence without rewriting it", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-accounts-precedence-"));
-  const legacy = join(dir, "pi-codex-accounts.json");
-  const canonical = join(dir, ACCOUNTS_FILE);
-  try {
-    await writeFile(legacy, JSON.stringify({ active: "old", accounts: { old: credential("old") } }));
-    await writeFile(canonical, JSON.stringify({ version: 1, providers: {} }));
-    weakenFilePermissions(canonical);
-
-    const result = await migrateLegacyCodexAccountsFile(legacy, canonical);
-    assert.equal(result.status, "canonical");
-    assert.deepEqual(parseAccountsData(await readFile(canonical, "utf8")), {
-      version: 1,
-      providers: Object.assign(Object.create(null), {}),
-    });
-    assertPrivateFile(canonical);
-  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(dir, { recursive: true, force: true });
   }
 });

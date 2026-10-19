@@ -36,7 +36,7 @@ async function fixture(id: AccountProviderId, api?: string) {
     accounts: { work: { type: "api_key", key }, subscription: oauth },
   }));
   const mock = createMockPi();
-  const coordinator = new RuntimeAuthCoordinator(mock.pi, provider);
+  const coordinator = new RuntimeAuthCoordinator(provider);
   const context = (): ExtensionContext =>
     createMockContext({
       model: registry.find(id, model.id),
@@ -129,7 +129,7 @@ test("Kimi checks only models offered to the selected OAuth account", async () =
     ...state,
     accounts: { ...state.accounts, subscription: { ...oauth, availableModelIds: [f.model.id] } },
   }));
-  const coordinator = new RuntimeAuthCoordinator(f.mock.pi, {
+  const coordinator = new RuntimeAuthCoordinator({
     ...f.provider,
     oauth: { ...f.provider.oauth, toAuth: async (value) => ({ headers: { Authorization: `Bearer ${value.access}` } }) },
   });
