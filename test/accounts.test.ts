@@ -117,6 +117,8 @@ function runtimeHarness(mock: ReturnType<typeof createMockPi>, options: { isolat
   const registry = {
     runtime,
     getRegisteredProviderConfig: (provider: string) => providerConfigs.get(provider),
+    getRegisteredNativeProvider: () => undefined,
+    getModelsOfType: () => [],
     registerProvider(provider: string, config: unknown) {
       if (!options.isolateProviders) {
         mock.rawPi.registerProvider(provider, config);

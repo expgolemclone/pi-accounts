@@ -84,6 +84,7 @@ function normalizeSelections(value: Record<string, unknown>): ProviderAccountSel
   if (entries.length > MAX_PROVIDER_SELECTIONS) throw new Error("Too many account selections.");
   const selections = Object.create(null) as ProviderAccountSelections;
   for (const [providerId, accountName] of entries) {
+    if (providerId === "openai") continue;
     if (!PROVIDER_ID_RE.test(providerId)) throw new Error("Invalid account selection provider.");
     if (accountName === null) {
       Object.defineProperty(selections, providerId, {

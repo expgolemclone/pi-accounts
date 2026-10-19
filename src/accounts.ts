@@ -86,6 +86,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
   ];
   validateProviderSet(providers, dependencies.providers === undefined);
   const adapters = new Map(providers.map((provider) => [provider.id, provider]));
+  const sessionProviders = providers.filter((provider) => provider.id !== "openai");
   const sessionOwners = new WeakMap<ExtensionContext["sessionManager"], SessionSelectionOwner>();
   registerOAuthCredentialSource(pi, [
     {
@@ -104,6 +105,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
     sessionOwners.get(owner.sessionManager) === owner && !owner.signal.aborted;
 
   const initializeOwner = async (owner: SessionSelectionOwner, ctx: ExtensionContext): Promise<void> => {
+    if (sessionProviders.length === 0) return;
     const restored = restoreAccountSelections(ctx.sessionManager.getEntries(), owner.sessionId);
     if (restored.status === "invalid") {
       owner.error = restored.message;
@@ -119,12 +121,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
       restored.status === "loaded"
         ? restored.selections
         : cloneAccountSelections(Object.create(null) as ProviderAccountSelections);
-    if (adapters.has("openai")) {
-      const shared = await sharedSelection.ensure(owner.signal);
-      if (!isOwnerCurrent(owner)) return;
-      selections = setAccountSelection(selections, "openai", shared.account);
-    }
-    const missingProviders = providers.filter((provider) => !Object.hasOwn(selections, provider.id));
+    const missingProviders = sessionProviders.filter((provider) => !Object.hasOwn(selections, provider.id));
     if (restored.status === "loaded" && missingProviders.length === 0) {
       owner.selections = selections;
       return;
@@ -235,9 +232,11 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
       );
       if (!published || !isOwnerCurrent(owner) || !isCurrent()) return false;
       openaiRequests?.cancel(owner.context, true);
+      owner.selectionRevisions.set(providerId, (owner.selectionRevisions.get(providerId) ?? 0) + 1);
+      return true;
     }
     let selections = owner.error
-      ? providers.reduce<ProviderAccountSelections>(
+      ? sessionProviders.reduce<ProviderAccountSelections>(
           (current, provider) => setAccountSelection(current, provider.id, null),
           cloneAccountSelections(Object.create(null) as ProviderAccountSelections),
         )
@@ -268,6 +267,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
       if (!isOwnerCurrent(owner)) return staleResult(providerId);
       const signal = ownerSignal ? AbortSignal.any([owner.signal, ownerSignal]) : owner.signal;
       let selectionError = owner.environmentError ?? (owner.environmentAccount === undefined ? owner.error : undefined);
+      let selectedAccount = owner.environmentAccount ?? owner.selections[providerId] ?? null;
       let sharedRevision: string | undefined;
       if (providerId === "openai") {
         try {
@@ -275,7 +275,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
             throw new Error("Shared OpenAI account selection requires PI_ACCOUNT to be unset.");
           const shared = await sharedSelection.ensure(signal);
           if (!isOwnerCurrent(owner)) return staleResult(providerId);
-          owner.selections = setAccountSelection(owner.selections, "openai", shared.account);
+          selectedAccount = shared.account;
           sharedRevision = shared.revision;
           selectionError = undefined;
         } catch (error) {
@@ -284,13 +284,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
       }
       let result = selectionError
         ? await coordinator.forceFailClosed(ctx, "unknown", new Error(selectionError))
-        : await coordinator.ensureActive(
-            ctx,
-            store,
-            owner.environmentAccount ?? owner.selections[providerId] ?? null,
-            Date.now(),
-            signal,
-          );
+        : await coordinator.ensureActive(ctx, store, selectedAccount, Date.now(), signal);
       if (providerId === "openai" && sharedRevision && result.status !== "error" && isOwnerCurrent(owner)) {
         const latestShared = readSharedSelection(await store.readProviderAsync("openai", signal));
         if (latestShared?.revision !== sharedRevision) return syncProvider(providerId, ctx, owner, ownerSignal, model);
@@ -830,19 +824,19 @@ async function removeAccount(
   const parsed = parseAccountName(nameArg);
   if (!parsed.ok) return ctx.ui.notify(parsed.error, "warning");
   let removed = false;
+  let removedSharedSelection = false;
   try {
     await store.updateProvider(adapter.id, (state) => {
       if (!isCurrent() || !getOwnCredential(state.accounts, parsed.name)) return state;
       removed = true;
+      removedSharedSelection = adapter.id === "openai" && readSharedSelection(state)?.account === parsed.name;
       const accounts = defineOwnMap(state.accounts);
       delete accounts[parsed.name];
       return {
         ...state,
         active: state.active === parsed.name ? undefined : state.active,
         accounts,
-        ...(adapter.id === "openai" && readSharedSelection(state)?.account === parsed.name
-          ? { sharedSelection: { account: null, revision: randomUUID() } }
-          : {}),
+        ...(removedSharedSelection ? { sharedSelection: { account: null, revision: randomUUID() } } : {}),
       };
     });
   } catch {
@@ -870,7 +864,8 @@ async function removeAccount(
     }
     return;
   }
-  const removedSelection = !session.error && session.selections[adapter.id] === parsed.name;
+  const removedSelection =
+    adapter.id === "openai" ? removedSharedSelection : !session.error && session.selections[adapter.id] === parsed.name;
   if (removedSelection) {
     try {
       if (adapter.id !== "openai" && !(await persistSelection(session, adapter.id, null, isCurrent))) return;

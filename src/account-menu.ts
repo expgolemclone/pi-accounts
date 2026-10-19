@@ -252,7 +252,7 @@ async function readProviderMenuStates(
       active,
       defaultAccount: state.active,
       selectionInvalid:
-        (session.environmentAccount === undefined && session.error !== undefined) ||
+        (id !== "openai" && session.environmentAccount === undefined && session.error !== undefined) ||
         session.environmentError !== undefined ||
         (active !== undefined && !getOwnCredential(state.accounts, active)),
       accounts: state.accounts,

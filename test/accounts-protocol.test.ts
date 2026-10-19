@@ -108,16 +108,17 @@ test("topology inventories both credential kinds and default without secrets", a
 });
 for (const account of ["alpha", "beta"] as const) {
   test(`${account} activation overrides NEW-session default before first auth resolution`, async () => {
-    const { mock, session } = await fixture();
+    const { mock, store, session } = await fixture();
     const current = await session();
     const result = await activate(mock, current.manager, account);
     assert.deepEqual(result, { status: "active", providerId: "openai", accountName: account });
-    const selection = current.manager
-      .getEntries()
-      .filter((entry) => entry.type === "custom" && entry.customType === "pi-accounts-selection")
-      .at(-1);
-    assert.ok(selection?.type === "custom");
-    assert.equal((selection.data as { providers: Record<string, string | null> }).providers.openai, account);
+    assert.equal((await store.readProviderAsync("openai")).active, account);
+    assert.equal(
+      current.manager
+        .getEntries()
+        .some((entry) => entry.type === "custom" && entry.customType === "pi-accounts-selection"),
+      false,
+    );
     assert.equal(await current.registry.getApiKeyForProvider("openai"), account === "alpha" ? access : key);
     safe(result);
     const restored = await activate(mock, current.manager, null);
@@ -125,6 +126,65 @@ for (const account of ["alpha", "beta"] as const) {
     assert.notEqual(await current.registry.getApiKeyForProvider("openai"), account === "alpha" ? access : key);
   });
 }
+test("shared OpenAI activation does not depend on session persistence", async () => {
+  const { mock, store, session } = await fixture();
+  const current = await session({ provider: "openai", id: "gpt-4o" });
+  await activate(mock, current.manager, "beta");
+  const before = current.manager.getEntries().length;
+  current.manager.appendCustomEntry = () => {
+    throw new Error("session persistence unavailable");
+  };
+  try {
+    const result = await activate(mock, current.manager, "alpha");
+    assert.deepEqual(result, { status: "active", providerId: "openai", accountName: "alpha" });
+    assert.equal((await store.readProviderAsync("openai")).active, "alpha");
+    assert.equal(await current.registry.getApiKeyForProvider("openai"), access);
+    assert.equal(current.manager.getEntries().length, before);
+    await mock.events.get("before_agent_start")?.[0]?.({}, current.ctx);
+    assert.equal(await current.registry.getApiKeyForProvider("openai"), access);
+    assert.equal((await activate(mock, current.manager, null)).status, "inactive");
+    assert.equal(current.manager.getEntries().length, before);
+  } finally {
+    await mock.events.get("session_shutdown")?.[0]?.({}, current.ctx);
+  }
+});
+
+test("shared OpenAI activation neither depends on nor repairs failed session-local persistence", async () => {
+  const mock = createMockPi();
+  const store = new AccountStore(new InMemoryAccountStorageBackend());
+  await store.updateProvider("openai", () => ({ accounts: { alpha: credential } }));
+  await store.updateProvider("anthropic", () => ({ active: "work", accounts: { work: credential } }));
+  accountsExtension(mock.pi, {
+    store,
+    providers: [provider, { ...provider, id: "anthropic", displayName: "Anthropic" }],
+  });
+  const runtime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsPath: null,
+    refreshOnCreate: false,
+  });
+  const registry = new ModelRegistry(runtime);
+  const manager = SessionManager.inMemory();
+  manager.appendCustomEntry = () => {
+    throw new Error("session persistence unavailable");
+  };
+  const { ctx } = createMockContext({
+    sessionManager: manager,
+    modelRegistry: registry,
+    model: registry.getAll().find((model) => model.provider === "anthropic"),
+  });
+  await mock.events.get("session_start")?.[0]?.({}, ctx);
+  try {
+    assert.equal((await activate(mock, manager, "alpha")).status, "active");
+    assert.equal(await registry.getApiKeyForProvider("openai"), access);
+    await mock.events.get("before_agent_start")?.[0]?.({}, ctx);
+    assert.equal(await registry.getApiKeyForProvider("anthropic"), RUNTIME_FAIL_CLOSED_API_KEY);
+    assert.equal(manager.getEntries().length, 0);
+  } finally {
+    await mock.events.get("session_shutdown")?.[0]?.({}, ctx);
+  }
+});
+
 test("PI_ACCOUNT conflicts with shared OpenAI selection and fails closed without changing selection", async () => {
   process.env.PI_ACCOUNT = "alpha";
   const { mock, session } = await fixture();

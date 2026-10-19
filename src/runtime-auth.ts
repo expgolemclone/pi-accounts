@@ -1,6 +1,13 @@
 // Cohesion justification: runtime activation, provider overlays, API-key ownership, and
 // verification helpers share generation-checked fail-closed invariants that are reviewed together.
-import type { ModelAuth, OAuthCredential, ProviderHeaders } from "@earendil-works/pi-ai";
+import {
+  type AnyModel,
+  envApiKeyAuth,
+  type ModelAuth,
+  type OAuthCredential,
+  type Provider,
+  type ProviderHeaders,
+} from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { StoredCredential } from "./account-store.js";
 import type { AccountActivationErrorCode } from "./accounts-protocol.js";
@@ -33,6 +40,9 @@ type RuntimeOverrideSnapshot = {
 };
 
 type RuntimeProviderConfig = Parameters<ExtensionAPI["registerProvider"]>[1];
+type RuntimeProviderRegistration =
+  | { kind: "native"; provider: Provider }
+  | { kind: "config"; config: RuntimeProviderConfig };
 
 type ProviderAccountState = {
   active?: string;
@@ -597,7 +607,9 @@ export class RuntimeAuthCoordinator {
     signal: AbortSignal,
     availableModelIds?: readonly string[],
   ): Promise<void> {
-    const registered = getRegisteredProviderConfig(ctx, this.provider.id);
+    const registered =
+      ctx.modelRegistry.getRegisteredNativeProvider(this.provider.id) ??
+      ctx.modelRegistry.getRegisteredProviderConfig(this.provider.id);
     if (auth.baseUrl && registered?.baseUrl !== auth.baseUrl) {
       throw new Error(`Pi did not retain the runtime ${this.provider.displayName} endpoint.`);
     }
@@ -644,8 +656,8 @@ export class RuntimeAuthCoordinator {
 class RuntimeProviderOverlay {
   private generation = 0;
   private owned = false;
-  private previous: RuntimeProviderConfig | undefined;
-  private applied: RuntimeProviderConfig | undefined;
+  private previous: RuntimeProviderRegistration | undefined;
+  private applied: RuntimeProviderRegistration | undefined;
   private baseModels: NonNullable<RuntimeProviderConfig["models"]> | undefined;
   private baseStream: RuntimeProviderConfig["streamSimple"];
 
@@ -681,8 +693,8 @@ class RuntimeProviderOverlay {
       if (this.owned) this.remove(ctx, generation);
       return true;
     }
-    const current = getRegisteredProviderConfig(ctx, this.provider.id);
-    if (this.owned && !shallowConfigEqual(current, this.applied)) {
+    const current = readProviderRegistration(ctx, this.provider.id);
+    if (this.owned && !sameProviderRegistration(current, this.applied)) {
       this.reset();
       throw new Error(
         `${this.provider.displayName} provider configuration changed while pi-accounts owned its auth overlay.`,
@@ -690,23 +702,36 @@ class RuntimeProviderOverlay {
     }
     if (!this.owned) {
       this.previous = current;
-      this.baseModels = readProviderModels(ctx, this.provider.id);
+      this.baseModels = [
+        ...readProviderModels(ctx, this.provider.id),
+        ...ctx.modelRegistry.getModelsOfType("image", this.provider.id),
+        ...ctx.modelRegistry.getModelsOfType("classifier", this.provider.id),
+      ];
       const provider = wrapStream ? ctx.modelRegistry.getProvider(this.provider.id) : undefined;
-      this.baseStream = this.previous?.streamSimple ?? provider?.streamSimple.bind(provider);
+      this.baseStream =
+        (current?.kind === "config" ? current.config.streamSimple : undefined) ?? provider?.streamSimple.bind(provider);
     }
 
-    const next = this.buildConfig(auth, availableModelIds);
-    if (wrapStream) {
-      if (!this.baseStream) {
-        const provider = ctx.modelRegistry.getProvider(this.provider.id);
-        this.baseStream = provider?.streamSimple.bind(provider);
+    let next: RuntimeProviderRegistration;
+    if (this.previous?.kind === "native") {
+      next = {
+        kind: "native",
+        provider: this.buildNativeProvider(this.previous.provider, auth, availableModelIds, wrapStream),
+      };
+    } else {
+      const config = this.buildConfig(auth, availableModelIds);
+      if (wrapStream) {
+        if (!this.baseStream) {
+          const provider = ctx.modelRegistry.getProvider(this.provider.id);
+          this.baseStream = provider?.streamSimple.bind(provider);
+        }
+        if (!this.baseStream) throw new Error("OpenAI inference stream is unavailable for request synchronization.");
+        config.api ??= "openai-responses";
+        config.streamSimple = wrapStream(this.baseStream);
       }
-      if (!this.baseStream) throw new Error("OpenAI inference stream is unavailable for request synchronization.");
-      next.api ??= "openai-responses";
-      next.streamSimple = wrapStream(this.baseStream);
+      next = { kind: "config", config };
     }
-    if (Object.keys(next).length === 0 && !this.owned) return true;
-    this.replaceConfig(ctx, this.owned ? this.applied : current, next);
+    replaceProviderRegistration(ctx, this.provider.id, current, next);
     this.owned = true;
     this.applied = next;
     return true;
@@ -714,48 +739,89 @@ class RuntimeProviderOverlay {
 
   remove(ctx: ExtensionContext, generation: number): void {
     if (generation !== this.generation || !this.owned) return;
-    const current = getRegisteredProviderConfig(ctx, this.provider.id);
-    if (!shallowConfigEqual(current, this.applied)) {
+    const current = readProviderRegistration(ctx, this.provider.id);
+    if (!sameProviderRegistration(current, this.applied)) {
       this.reset();
       return;
     }
-    ctx.modelRegistry.unregisterProvider(this.provider.id);
-    if (this.previous && Object.keys(this.previous).length > 0) {
-      ctx.modelRegistry.registerProvider(this.provider.id, this.previous);
-    }
+    replaceProviderRegistration(ctx, this.provider.id, current, this.previous);
     this.reset();
   }
 
   private buildConfig(auth: ModelAuth, availableModelIds?: readonly string[]): RuntimeProviderConfig {
-    const next: RuntimeProviderConfig = { ...(this.previous ?? {}) };
+    const previous = this.previous?.kind === "config" ? this.previous.config : undefined;
+    const next: RuntimeProviderConfig = { ...(previous ?? {}) };
     if (this.provider.requiresApiKeyBridge) next.apiKey = this.fallbackApiKey;
     if (auth.baseUrl) next.baseUrl = auth.baseUrl;
-    if (auth.headers) next.headers = mergeConfigHeaders(this.previous?.headers, auth.headers);
+    if (auth.headers) next.headers = mergeConfigHeaders(previous?.headers, auth.headers);
     if (availableModelIds) {
       const allowed = new Set(availableModelIds);
       next.models = (this.baseModels ?? [])
-        .filter((model) => allowed.has(model.id))
+        .filter((model) => model.type === "image" || model.type === "classifier" || allowed.has(model.id))
         .map((model) => (auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model));
     }
     return next;
   }
 
-  private replaceConfig(
-    ctx: ExtensionContext,
-    fallback: RuntimeProviderConfig | undefined,
-    next: RuntimeProviderConfig,
-  ): void {
-    ctx.modelRegistry.unregisterProvider(this.provider.id);
-    try {
-      if (Object.keys(next).length > 0) {
-        ctx.modelRegistry.registerProvider(this.provider.id, next);
-      }
-    } catch (error) {
-      if (fallback && Object.keys(fallback).length > 0) {
-        ctx.modelRegistry.registerProvider(this.provider.id, fallback);
-      }
-      throw error;
-    }
+  private buildNativeProvider(
+    native: Provider,
+    auth: ModelAuth,
+    availableModelIds?: readonly string[],
+    wrapStream?: StreamWrapper,
+  ): Provider {
+    const allowed = availableModelIds ? new Set(availableModelIds) : undefined;
+    const project = <T extends AnyModel>(models: readonly T[]): T[] =>
+      models
+        .filter((model) => !allowed || model.type === "image" || model.type === "classifier" || allowed.has(model.id))
+        .map((model) => (auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model));
+    const applyAuth = (current: ModelAuth): ModelAuth => ({
+      ...current,
+      ...(auth.baseUrl ? { baseUrl: auth.baseUrl } : {}),
+      ...(auth.headers ? { headers: mergeConfigHeaders(current.headers, auth.headers) } : {}),
+    });
+    const apiKey = native.auth.apiKey ?? envApiKeyAuth(this.provider.displayName, []);
+    const oauth = native.auth.oauth;
+    const streamSimple = native.streamSimple.bind(native);
+    return {
+      ...native,
+      id: native.id,
+      name: native.name,
+      baseUrl: auth.baseUrl ?? native.baseUrl,
+      headers: auth.headers ? mergeConfigHeaders(native.headers, auth.headers) : native.headers,
+      auth: {
+        ...native.auth,
+        apiKey: {
+          ...apiKey,
+          login: apiKey.login?.bind(apiKey),
+          check: apiKey.check?.bind(apiKey),
+          resolve: async (input) => {
+            const result = await apiKey.resolve(input);
+            return result ? { ...result, auth: applyAuth(result.auth) } : undefined;
+          },
+        },
+        ...(oauth
+          ? {
+              oauth: {
+                ...oauth,
+                login: oauth.login.bind(oauth),
+                refresh: oauth.refresh.bind(oauth),
+                toAuth: async (credential) => applyAuth(await oauth.toAuth(credential)),
+              },
+            }
+          : {}),
+      },
+      getModels: () => project(native.getModels()),
+      getAllModels: () => project(native.getAllModels?.() ?? native.getModels()),
+      refreshModels: native.refreshModels?.bind(native),
+      filterModels: native.filterModels?.bind(native),
+      filterAllModels: native.filterAllModels?.bind(native),
+      stream: native.stream.bind(native),
+      streamSimple: wrapStream ? wrapStream(streamSimple) : streamSimple,
+      fetchDeferred: native.fetchDeferred?.bind(native),
+      cancelDeferred: native.cancelDeferred?.bind(native),
+      generateImages: native.generateImages?.bind(native),
+      classify: native.classify?.bind(native),
+    };
   }
 
   private reset(): void {
@@ -868,27 +934,8 @@ function replaceModelDefinition(target: object, source: object): void {
   }
 }
 
-function readProviderModels(ctx: ExtensionContext, providerId: string): NonNullable<RuntimeProviderConfig["models"]> {
-  const registry = ctx.modelRegistry as unknown as {
-    getAll?: () => readonly Record<string, unknown>[];
-  };
-  const models = typeof registry.getAll === "function" ? registry.getAll() : [];
-  return models
-    .filter((model) => model.provider === providerId && typeof model.id === "string")
-    .map((model) => ({
-      id: String(model.id),
-      name: typeof model.name === "string" ? model.name : String(model.id),
-      ...(typeof model.api === "string" ? { api: model.api as never } : {}),
-      ...(typeof model.baseUrl === "string" ? { baseUrl: model.baseUrl } : {}),
-      reasoning: model.reasoning === true,
-      ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap as never } : {}),
-      input: Array.isArray(model.input) ? (model.input as ("text" | "image")[]) : ["text"],
-      cost: (model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) as never,
-      contextWindow: typeof model.contextWindow === "number" ? model.contextWindow : 0,
-      maxTokens: typeof model.maxTokens === "number" ? model.maxTokens : 0,
-      ...(model.headers ? { headers: model.headers as Record<string, string> } : {}),
-      ...(model.compat ? { compat: model.compat as never } : {}),
-    }));
+function readProviderModels(ctx: ExtensionContext, providerId: string) {
+  return ctx.modelRegistry.getAll().filter((model) => model.provider === providerId);
 }
 
 function readHeader(
@@ -907,11 +954,11 @@ function hasHeader(headers: ProviderHeaders | Record<string, string> | undefined
   return Object.keys(headers ?? {}).some((candidate) => candidate.toLowerCase() === expected);
 }
 
-function mergeConfigHeaders(
-  previous: Record<string, string> | undefined,
-  headers: Record<string, string | null>,
-): Record<string, string> {
-  const result = { ...(previous ?? {}) };
+function mergeConfigHeaders(previous: ProviderHeaders | undefined, headers: ProviderHeaders): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(previous ?? {})) {
+    if (value !== null) result[name] = value;
+  }
   for (const [name, value] of Object.entries(headers)) {
     for (const existing of Object.keys(result)) {
       if (existing.toLowerCase() === name.toLowerCase()) delete result[existing];
@@ -1037,15 +1084,40 @@ function getOwnCredential(accounts: Record<string, StoredCredential>, name: stri
   return Object.hasOwn(accounts, name) ? accounts[name] : undefined;
 }
 
-function getRegisteredProviderConfig(ctx: ExtensionContext, providerId: string): RuntimeProviderConfig | undefined {
-  const registry = ctx.modelRegistry as unknown as {
-    getRegisteredProviderConfig?: (provider: string) => RuntimeProviderConfig | undefined;
-    registeredProviders?: Map<string, RuntimeProviderConfig>;
+function readProviderRegistration(ctx: ExtensionContext, providerId: string): RuntimeProviderRegistration | undefined {
+  const provider = ctx.modelRegistry.getRegisteredNativeProvider(providerId);
+  if (provider) return { kind: "native", provider };
+  const config = ctx.modelRegistry.getRegisteredProviderConfig(providerId);
+  return config ? { kind: "config", config } : undefined;
+}
+
+function replaceProviderRegistration(
+  ctx: ExtensionContext,
+  providerId: string,
+  previous: RuntimeProviderRegistration | undefined,
+  next: RuntimeProviderRegistration | undefined,
+): void {
+  const register = (registration: RuntimeProviderRegistration | undefined) => {
+    if (registration?.kind === "native") ctx.modelRegistry.registerProvider(registration.provider);
+    else if (registration?.kind === "config") ctx.modelRegistry.registerProvider(providerId, registration.config);
   };
-  if (typeof registry.getRegisteredProviderConfig === "function") {
-    return registry.getRegisteredProviderConfig(providerId);
+  ctx.modelRegistry.unregisterProvider(providerId);
+  try {
+    register(next);
+  } catch (error) {
+    ctx.modelRegistry.unregisterProvider(providerId);
+    register(previous);
+    throw error;
   }
-  return registry.registeredProviders instanceof Map ? registry.registeredProviders.get(providerId) : undefined;
+}
+
+function sameProviderRegistration(
+  left: RuntimeProviderRegistration | undefined,
+  right: RuntimeProviderRegistration | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  if (left.kind === "native") return right.kind === "native" && left.provider === right.provider;
+  return right.kind === "config" && shallowConfigEqual(left.config, right.config);
 }
 
 function shallowConfigEqual(

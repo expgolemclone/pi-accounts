@@ -72,6 +72,23 @@ test("session account selections preserve valid unknown providers and own proper
   );
 });
 
+test("shared OpenAI selection is neither persisted nor restored from session snapshots", () => {
+  const data = createAccountSelectionEntryData("session", { openai: "shared", anthropic: "work" });
+  assert.deepEqual({ ...data.providers }, { anthropic: "work" });
+  const restored = restoreAccountSelections(
+    [
+      customEntry({
+        version: 1,
+        sessionId: "session",
+        providers: { openai: { obsolete: true }, anthropic: "work" },
+      }),
+    ],
+    "session",
+  );
+  assert.equal(restored.status, "loaded");
+  if (restored.status === "loaded") assert.deepEqual({ ...restored.selections }, { anthropic: "work" });
+});
+
 test("session account selections reject malformed matching snapshots without using older state", () => {
   const valid = customEntry(createAccountSelectionEntryData("session", { anthropic: "work" }), "valid000");
   const malformed = customEntry({ version: 2, sessionId: "session", providers: { anthropic: "personal" } }, "invalid0");
