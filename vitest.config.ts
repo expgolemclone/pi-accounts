@@ -1,4 +1,3 @@
-import { availableParallelism } from "node:os";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -12,10 +11,8 @@ export default defineConfig({
     hookTimeout: 30_000,
     include: ["test/**/*.test.ts", "packages/*/test/**/*.test.ts"],
     globalSetup: ["./test/vitest.global-setup.ts"],
-    // Integration files spawn Git, LSP, and MCP children in addition to their workers.
-    // Two fork workers leave room for cold Jiti loads and their child processes
-    // without enlarging the five-second per-test budget. CLI overrides remain available.
-    maxWorkers: Math.min(2, availableParallelism()),
+    // Integration tests launch their own concurrent processes.
+    maxWorkers: 1,
     pool: "forks",
     runner: "./test/vitest.runner.ts",
     setupFiles: ["./test/vitest.setup.ts"],

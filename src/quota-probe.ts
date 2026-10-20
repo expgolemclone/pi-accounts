@@ -15,7 +15,7 @@ import { refreshAccountCredential } from "./runtime-auth.js";
 // inference, resource isolation and IPC handling live in the typechecked worker module.
 const WORKER_BOOTSTRAP = `
 const { createJiti } = await import(process.argv[1]);
-const worker = await createJiti(process.argv[2], { fsCache: false, moduleCache: false, tryNative: false }).import(process.argv[2]);
+const worker = await createJiti(process.argv[2], { tryNative: true }).import(process.argv[2]);
 worker.startProbeWorker();
 `;
 

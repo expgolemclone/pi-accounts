@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
-import { test } from "vitest";
+import { afterAll, beforeAll, test } from "vitest";
 import { AccountStore } from "../src/account-store.js";
 import { FileAccountStorageBackend } from "../src/storage.js";
 
@@ -19,7 +19,7 @@ const deferred = <T>() => {
   return { promise, resolve };
 };
 
-test("independent Pi sessions wait for one representative, including late failures; idle sessions only adopt", async () => {
+async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), "accounts-live-sessions-"));
   const cache = fileURLToPath(new URL("../node_modules/.cache/", import.meta.url));
   await mkdir(cache, { recursive: true });
@@ -86,40 +86,55 @@ test("independent Pi sessions wait for one representative, including late failur
       },
     };
   });
-  try {
-    await Promise.all(actors.map((actor) => actor.ready));
-    for (const actor of actors) actor.check();
-    const affected = actors.slice(0, 3);
-    for (const actor of affected) actor.child.send("run");
-    await Promise.all(affected.map((actor) => actor.request));
-    affected[0]?.child.send("release");
-    affected[1]?.child.send("release");
-    const early = await Promise.all(affected.slice(0, 2).map((actor) => actor.result));
-    assert.equal(probes, 1);
-    for (const result of early) {
-      assert.equal(result.kind, "result");
-      assert.deepEqual(result.keys, ["a", "b"]);
-      assert.equal(result.continuations, 1);
-      assert.equal(result.text, "recovered");
-    }
-    affected[2]?.child.send("release");
-    const late = await affected[2]?.result;
-    assert.deepEqual(late?.keys, ["a", "b"]);
-    assert.equal(late?.continuations, 1);
-    assert.equal(probes, 1);
-    const idle = actors[3];
-    assert.ok(idle);
-    idle.child.send("run");
-    const adopted = await idle.result;
-    assert.deepEqual(adopted.keys, ["b"]);
-    assert.equal(adopted.continuations, 0);
-    assert.equal(probes, 1);
-    await Promise.all(actors.map((actor) => actor.closed));
-  } finally {
-    for (const actor of actors)
-      if (actor.child.exitCode === null && actor.child.signalCode === null) actor.child.kill();
-    await Promise.all(actors.map((actor) => actor.closed));
-    await rm(directory, { recursive: true, force: true });
-    await rm(artifacts, { recursive: true, force: true });
+  return {
+    actors,
+    probes: () => probes,
+    cleanup: async () => {
+      for (const actor of actors)
+        if (actor.child.exitCode === null && actor.child.signalCode === null) actor.child.kill();
+      await Promise.all(actors.map((actor) => actor.closed));
+      await rm(directory, { recursive: true, force: true });
+      await rm(artifacts, { recursive: true, force: true });
+    },
+  };
+}
+
+let h: Awaited<ReturnType<typeof fixture>>;
+beforeAll(async () => {
+  h = await fixture();
+  await Promise.all(h.actors.map((actor) => actor.ready));
+  for (const actor of h.actors) actor.check();
+});
+afterAll(async () => {
+  await h?.cleanup();
+});
+
+test("independent Pi sessions wait for one representative, including late failures; idle sessions only adopt", async () => {
+  const { actors } = h;
+  const affected = actors.slice(0, 3);
+  for (const actor of affected) actor.child.send("run");
+  await Promise.all(affected.map((actor) => actor.request));
+  affected[0]?.child.send("release");
+  affected[1]?.child.send("release");
+  const early = await Promise.all(affected.slice(0, 2).map((actor) => actor.result));
+  assert.equal(h.probes(), 1);
+  for (const result of early) {
+    assert.equal(result.kind, "result");
+    assert.deepEqual(result.keys, ["a", "b"]);
+    assert.equal(result.continuations, 1);
+    assert.equal(result.text, "recovered");
   }
+  affected[2]?.child.send("release");
+  const late = await affected[2]?.result;
+  assert.deepEqual(late?.keys, ["a", "b"]);
+  assert.equal(late?.continuations, 1);
+  assert.equal(h.probes(), 1);
+  const idle = actors[3];
+  assert.ok(idle);
+  idle.child.send("run");
+  const adopted = await idle.result;
+  assert.deepEqual(adopted.keys, ["b"]);
+  assert.equal(adopted.continuations, 0);
+  assert.equal(h.probes(), 1);
+  await Promise.all(actors.map((actor) => actor.closed));
 });

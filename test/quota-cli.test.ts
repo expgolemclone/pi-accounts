@@ -12,10 +12,14 @@ import { afterAll, beforeAll, test } from "vitest";
 let directory: string;
 let child: ChildProcess;
 let closed: Promise<unknown[]>;
-let run: () => void;
+let respond: () => void;
 let result: Promise<unknown>;
 let requests = 0;
 let input = "";
+let received!: () => void;
+const requestReceived = new Promise<void>((done) => {
+  received = done;
+});
 const server = createServer((request, response) => {
   requests++;
   request.setEncoding("utf8");
@@ -33,8 +37,11 @@ const server = createServer((request, response) => {
       { type: "response.output_item.done", output_index: 0, item },
       { type: "response.completed", response: { status: "completed", output: [item] } },
     ];
-    response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
+    respond = () => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
+    };
+    received();
   });
 });
 
@@ -132,7 +139,13 @@ export default function(pi) {
   });
   void result.catch(() => {});
   await ready;
-  run = () => child.send({ kind: "run" });
+  child.send({ kind: "run" });
+  await Promise.race([
+    requestReceived,
+    result.then(() => {
+      throw new Error("Probe completed without making a request.");
+    }),
+  ]);
 });
 
 afterAll(async () => {
@@ -144,7 +157,7 @@ afterAll(async () => {
 });
 
 test("bundled CLI runs the generated isolated probe without extension-local Pi peers", async () => {
-  run();
+  respond();
   assert.deepEqual({ result: await result, requests }, { result: "pong", requests: 1 });
   const [code] = await closed;
   assert.equal(code, 0);

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
-import { test } from "vitest";
+import { afterEach, beforeEach, test } from "vitest";
 import { AccountStore } from "../src/account-store.js";
 import { QuotaRecovery, type RecoveryResult } from "../src/quota-recovery.js";
 import { OpenAISelection } from "../src/shared-selection.js";
@@ -53,10 +53,10 @@ async function fixture() {
     ready: Promise<void>;
     probe: Promise<void>;
     result: Promise<RecoveryResult>;
-    run: (retryToken?: string) => boolean;
+    run: (options?: { hold?: boolean; timeoutMs?: number; quota?: boolean; retryToken?: string }) => boolean;
   };
   const children: Actor[] = [];
-  function start(hold = false, timeoutMs = 5_000, quota = false, retryToken?: string): Actor {
+  function start(): Actor {
     const child = spawn(process.execPath, [worker], {
       cwd: dirname(worker),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -94,7 +94,8 @@ async function fixture() {
       ready,
       probe,
       result,
-      run: (nextToken = retryToken) => child.send({ directory, failed, timeoutMs, hold, quota, retryToken: nextToken }),
+      run: ({ hold = false, timeoutMs = 5_000, quota = false, retryToken }: Parameters<Actor["run"]>[0] = {}) =>
+        child.send({ directory, failed, timeoutMs, hold, quota, retryToken }),
     };
     children.push(instance);
     return instance;
@@ -105,7 +106,7 @@ async function fixture() {
       new QuotaRecovery(store, selection, new FileAccountStorageBackend(join(directory, "recovery.json"))).retryToken(
         failed,
       ),
-    start,
+    actors: Array.from({ length: 4 }, () => start()),
     probes: () => probes,
     cleanup: async () => {
       for (const instance of children)
@@ -117,66 +118,60 @@ async function fixture() {
   };
 }
 
+let h: Awaited<ReturnType<typeof fixture>>;
+beforeEach(async () => {
+  h = await fixture();
+  await Promise.all(h.actors.map((actor) => actor.ready));
+});
+afterEach(async () => {
+  await h?.cleanup();
+});
+
 test("independent processes elect one representative and coalesce a late failure", async () => {
-  const h = await fixture();
-  try {
-    const actors = [h.start(), h.start(), h.start()];
-    const late = h.start();
-    await Promise.all([...actors, late].map((actor) => actor.ready));
-    for (const actor of actors) actor.run();
-    const results = await Promise.all(actors.map((actor) => actor.result));
-    assert.equal(h.probes(), 1, JSON.stringify(results));
-    assert.ok(results.every((result) => result.status === "ready"));
-    assert.deepEqual(results[0], results[1]);
-    assert.deepEqual(results[1], results[2]);
-    assert.equal((await h.selection.ensure()).account, "b");
-    late.run();
-    assert.deepEqual(await late.result, results[0]);
-    assert.equal(h.probes(), 1);
-    await Promise.all([...actors, late].map((actor) => actor.closed));
-  } finally {
-    await h.cleanup();
-  }
+  const actors = h.actors.slice(0, 3);
+  const late = h.actors[3];
+  assert.ok(late);
+  for (const actor of actors) actor.run();
+  const results = await Promise.all(actors.map((actor) => actor.result));
+  assert.equal(h.probes(), 1, JSON.stringify(results));
+  assert.ok(results.every((result) => result.status === "ready"));
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(results[1], results[2]);
+  assert.equal((await h.selection.ensure()).account, "b");
+  late.run();
+  assert.deepEqual(await late.result, results[0]);
+  assert.equal(h.probes(), 1);
+  await Promise.all([...actors, late].map((actor) => actor.closed));
 });
 
 test("new requests in independent processes elect just one fresh representative after a stopped round", async () => {
-  const h = await fixture();
-  try {
-    const first = h.start(false, 5_000, true);
-    const actors = [h.start(), h.start()];
-    await Promise.all([first, ...actors].map((actor) => actor.ready));
-    first.run();
-    assert.equal((await first.result).status, "stopped");
-    assert.equal(h.probes(), 1);
-    const token = await h.retryToken();
-    assert.ok(token);
-    for (const actor of actors) actor.run(token);
-    const results = await Promise.all(actors.map((actor) => actor.result));
-    assert.equal(results[0]?.status, "ready");
-    assert.deepEqual(results[0], results[1]);
-    assert.equal(h.probes(), 2);
-    assert.equal((await h.selection.ensure()).account, "b");
-    await Promise.all([first, ...actors].map((actor) => actor.closed));
-  } finally {
-    await h.cleanup();
-  }
+  const first = h.actors[0];
+  const actors = h.actors.slice(1, 3);
+  assert.ok(first);
+  first.run({ quota: true });
+  assert.equal((await first.result).status, "stopped");
+  assert.equal(h.probes(), 1);
+  const token = await h.retryToken();
+  assert.ok(token);
+  for (const actor of actors) actor.run({ retryToken: token });
+  const results = await Promise.all(actors.map((actor) => actor.result));
+  assert.equal(results[0]?.status, "ready");
+  assert.deepEqual(results[0], results[1]);
+  assert.equal(h.probes(), 2);
+  assert.equal((await h.selection.ensure()).account, "b");
+  await Promise.all([first, ...actors].map((actor) => actor.closed));
 });
 
 test("a dead representative stops waiters at its deadline without another probe", async () => {
-  const h = await fixture();
-  try {
-    const leader = h.start(true, 500);
-    const waiter = h.start(false, 500);
-    await Promise.all([leader.ready, waiter.ready]);
-    leader.run();
-    await leader.probe;
-    waiter.run();
-    leader.child.kill();
-    assert.equal((await waiter.result).status, "stopped");
-    assert.equal(h.probes(), 1);
-    assert.equal((await h.selection.ensure()).account, "a");
-    await waiter.closed;
-  } finally {
-    await h.cleanup();
-  }
+  const leader = h.actors[0];
+  const waiter = h.actors[1];
+  assert.ok(leader && waiter);
+  leader.run({ hold: true, timeoutMs: 500 });
+  await leader.probe;
+  waiter.run({ timeoutMs: 500 });
+  leader.child.kill();
+  assert.equal((await waiter.result).status, "stopped");
+  assert.equal(h.probes(), 1);
+  assert.equal((await h.selection.ensure()).account, "a");
+  await waiter.closed;
 });
