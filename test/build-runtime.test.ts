@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -202,6 +204,40 @@ test("Pi Accounts failed publication restores the previous runtime", async () =>
     await rm(root, { force: true, recursive: true });
   }
 });
+
+if (process.platform === "win32") {
+  test("runtime publication waits for a temporary Windows directory lock without copying files", async () => {
+    const builder = await loadBuilder();
+    const root = await mkdtemp(join(packageRoot, ".pi-accounts-build-test-"));
+    const staging = join(root, "staging");
+    const output = join(root, "dist");
+    await mkdir(staging);
+    await writeFile(join(staging, "next.ts"), "next");
+    const child = spawn(
+      process.execPath,
+      ["-e", 'process.send("ready"); process.on("message", () => process.exit())'],
+      { cwd: staging, stdio: ["ignore", "ignore", "ignore", "ipc"], windowsHide: true },
+    );
+    const closed = once(child, "close");
+    let release: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await once(child, "message");
+      await assert.rejects(rename(staging, output), (error: NodeJS.ErrnoException) =>
+        ["EBUSY", "EPERM", "EACCES"].includes(error.code ?? ""),
+      );
+      release = setTimeout(() => child.send("release"), 100);
+      await builder.publishRuntime(staging, output);
+      await closed;
+      assert.deepEqual(await listFiles(root), ["dist/next.ts"]);
+      assert.equal(await readFile(join(output, "next.ts"), "utf8"), "next");
+    } finally {
+      clearTimeout(release);
+      child.kill();
+      await closed;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
 
 function requireOutput(metadata: BuildMetadata, path: string) {
   const output = metadata.outputs?.[path];

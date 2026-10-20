@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readdir, readFile, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { build } from "esbuild";
+import gracefulFs from "graceful-fs";
 
+const rename = promisify(gracefulFs.rename);
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const temporaryPrefix = ".pi-accounts";
 const banner = [
