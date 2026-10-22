@@ -86,6 +86,38 @@ function safe(value: unknown) {
   for (const secret of [access, refresh, key]) assert.ok(!text.includes(secret));
 }
 
+test("session_start preserves the owner initialized by an earlier model_select", async () => {
+  const { mock, store } = await fixture();
+  const runtime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsPath: null,
+    refreshOnCreate: false,
+  });
+  const registry = new ModelRegistry(runtime);
+  const manager = SessionManager.inMemory(process.cwd());
+  const model = { provider: "openai", id: "gpt-4o" };
+  const { ctx } = createMockContext({ sessionManager: manager, modelRegistry: registry, model });
+  const signals: AbortSignal[] = [];
+  const originalRead = store.readProviderAsync.bind(store);
+  store.readProviderAsync = async (providerId, signal) => {
+    if (signal) signals.push(signal);
+    return originalRead(providerId, signal);
+  };
+  await mock.events.get("model_select")?.[0]?.({ model }, ctx);
+  assert.ok(signals.length > 0);
+  try {
+    await mock.events.get("session_start")?.[0]?.({}, ctx);
+    assert.ok(
+      signals.every((signal) => !signal.aborted),
+      "session_start must not dispose active pre-start auth",
+    );
+    await mock.events.get("before_agent_start")?.[0]?.({}, ctx);
+    assert.equal(await registry.getApiKeyForProvider("openai"), key);
+  } finally {
+    await mock.events.get("session_shutdown")?.[0]?.({}, ctx);
+  }
+});
+
 test("topology inventories both credential kinds and default without secrets", async () => {
   const { mock } = await fixture();
   const result = await new Promise<unknown>((resolve) => {

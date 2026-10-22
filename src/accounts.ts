@@ -154,6 +154,7 @@ export default function accountsExtension(pi: ExtensionAPI, dependencies: Accoun
 
   const startSessionOwner = (ctx: ExtensionContext): SessionSelectionOwner => {
     const previous = sessionOwners.get(ctx.sessionManager);
+    if (previous?.sessionId === ctx.sessionManager.getSessionId() && !previous.signal.aborted) return previous;
     if (previous) {
       openaiRequests?.cancel(previous.context);
       void previous.dispose(ctx);
