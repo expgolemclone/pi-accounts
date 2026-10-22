@@ -49,7 +49,7 @@ ${
     ? `$acl = New-Object Security.AccessControl.${directory ? "DirectorySecurity" : "FileSecurity"}
 $acl.SetSecurityDescriptorBinaryForm([Convert]::FromBase64String($inputPath))`
     : `$entry = New-Object IO.${directory ? "DirectoryInfo" : "FileInfo"}($inputPath)
-$acl = $entry.GetAccessControl()`
+$acl = [IO.FileSystemAclExtensions]::GetAccessControl($entry)`
 }
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
@@ -61,8 +61,11 @@ $expected = ${directory ? "'ContainerInherit,ObjectInherit'" : "'None'"}
 if ($rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]$expected) { throw 'Unexpected inheritance.' }
 `;
   execFileSync(
-    join(process.env.SystemRoot ?? "C:/Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"),
+    "mise.exe",
     [
+      "exec",
+      "--",
+      "pwsh",
       "-NoLogo",
       "-NoProfile",
       "-NonInteractive",
