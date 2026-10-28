@@ -12,11 +12,12 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { AccountStore } from "../src/account-store.js";
 import accountsExtension, { type AccountsDependencies } from "../src/accounts.js";
 import type { AccountProviderAdapter } from "../src/oauth.js";
 import { OPENAI_QUOTA_MESSAGE } from "../src/quota-errors.js";
+import { probeAccount } from "../src/quota-probe.js";
 import { QuotaRecovery } from "../src/quota-recovery.js";
 import { OpenAISelection } from "../src/shared-selection.js";
 import { FileAccountStorageBackend } from "../src/storage.js";
@@ -232,6 +233,49 @@ test("exact message-only quota recovers once and sends literal continue through 
     assert.match(inputs[1] ?? "", /continue/);
     assert.equal(session.getLastAssistantText(), "recovered");
     assert.equal(session.isIdle, true);
+  });
+});
+
+test("an expired candidate that cannot refresh is skipped before the real continuation uses the next account", async () => {
+  const requests: string[] = [];
+  const probes: string[] = [];
+  const refresh = vi
+    .spyOn(provider.oauth, "refresh")
+    .mockRejectedValue(new Error("refresh-token-rejected private-refresh-token"));
+  const h = await fixture(
+    async (input, init) => {
+      const name = new Request(input, init).headers.get("authorization")?.replace("Bearer offline-", "") ?? "";
+      requests.push(name);
+      if (name === "c") return completed("recovered past expired credential");
+      return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+    },
+    async (...args) => {
+      probes.push(args[4]);
+      return args[4] === "b" ? probeAccount(...args) : "pong";
+    },
+    undefined,
+    ["a", "b", "c"],
+  );
+  await use(h, async ({ session, store, selection, directory, manager }) => {
+    await store.updateProvider("openai", (state) => {
+      assert.equal(state.accounts.b?.type, "oauth");
+      return { ...state, accounts: { ...state.accounts, b: { ...state.accounts.b, expires: 0 } } };
+    });
+    await session.prompt("try the account after the expired credential");
+    assert.equal(refresh.mock.calls.length, 1);
+    assert.deepEqual(probes, ["b", "c"]);
+    assert.deepEqual(requests, ["a", "c"]);
+    assert.equal((await selection.ensure()).account, "c");
+    assert.equal(session.getLastAssistantText(), "recovered past expired credential");
+    assert.equal(session.isIdle, true);
+    assert.equal(
+      manager
+        .getEntries()
+        .filter((entry) => entry.type === "custom_message" && entry.customType === "accounts:quota-continue").length,
+      1,
+    );
+    assert.doesNotMatch(await readFile(join(directory, "recovery.json"), "utf8"), /private-refresh-token/);
+    assert.equal((await store.readProviderAsync("openai")).accounts.b?.expires, 0);
   });
 });
 

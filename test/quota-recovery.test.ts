@@ -118,7 +118,67 @@ test("non-quota probe failures stop without trying more candidates", async () =>
     assert.equal(probes, 1);
   }));
 
-for (const reason of ["modules", "initialization", "authentication", "transport", "provider", "reply"] as const) {
+for (const reason of ["credential", "authentication"] as const) {
+  test(`a candidate's ${reason} failure does not prevent trying the remaining accounts`, async () =>
+    fixture(async (h) => {
+      const attempted: string[] = [];
+      const signal = new AbortController().signal;
+      const probe = async (name: string) => {
+        attempted.push(name);
+        if (name === "first") throw new QuotaRecoveryError(reason);
+        return "pong" as const;
+      };
+      const ready = await h.createRecovery().recover(h.failed, probe, signal);
+      assert.equal(ready.status, "ready");
+      assert.deepEqual(attempted, ["first", "second"]);
+      assert.equal((await h.selection.ensure()).account, "second");
+      if (ready.status !== "ready") return;
+      const stopped = await h
+        .createRecovery()
+        .recover(await h.selection.ensure(), probe, signal, undefined, ready.round);
+      assert.equal(stopped.status, "stopped");
+      assert.deepEqual(attempted, ["first", "second"]);
+    }));
+
+  test(`all candidates with ${reason} failures finish one sweep and late failures do not probe again`, async () =>
+    fixture(async (h) => {
+      const attempted: string[] = [];
+      const signal = new AbortController().signal;
+      const probe = async (name: string) => {
+        attempted.push(name);
+        throw new QuotaRecoveryError(reason);
+      };
+      const recovery = h.createRecovery();
+      const stopped = await recovery.recover(h.failed, probe, signal);
+      assert.equal(stopped.status, "stopped");
+      assert.deepEqual(attempted, ["first", "second"]);
+      assert.deepEqual(await h.createRecovery().recover(h.failed, probe, signal), stopped);
+      assert.deepEqual(attempted, ["first", "second"]);
+      const token = await recovery.retryToken(h.failed, signal);
+      assert.ok(token);
+      assert.equal((await recovery.recover(h.failed, async () => "pong", signal, token)).status, "ready");
+    }));
+
+  test(`a candidate's ${reason} failure cannot swallow cancellation`, async () =>
+    fixture(async (h) => {
+      const attempted: string[] = [];
+      const controller = new AbortController();
+      const stopped = await h.createRecovery().recover(
+        h.failed,
+        async (name) => {
+          attempted.push(name);
+          controller.abort();
+          throw new QuotaRecoveryError(reason);
+        },
+        controller.signal,
+      );
+      assert.equal(stopped.status, "stopped");
+      assert.deepEqual(attempted, ["first"]);
+      assert.equal((await h.selection.ensure()).revision, h.failed.revision);
+    }));
+}
+
+for (const reason of ["modules", "initialization", "transport", "provider", "reply"] as const) {
   test(`safe ${reason} failure is published to late waiters without another probe`, async () =>
     fixture(async (h) => {
       let probes = 0;

@@ -262,6 +262,12 @@ export class QuotaRecovery {
       let outcome: "pong" | "quota";
       try {
         outcome = await probe(candidate, credential, probeSignal);
+      } catch (error) {
+        probeSignal.throwIfAborted();
+        // A broken login belongs to this candidate, not to the whole sweep.
+        if (error instanceof QuotaRecoveryError && (error.reason === "credential" || error.reason === "authentication"))
+          continue;
+        throw error;
       } finally {
         watchController.abort();
         await watch;
