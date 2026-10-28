@@ -99,7 +99,7 @@ test("the failed account is excluded and each candidate is attempted once withou
     assert.deepEqual([...attempted].sort(), ["first", "second"]);
     assert.equal(new Set(attempted).size, attempted.length);
     assert.equal((await h.selection.ensure()).revision, h.failed.revision);
-    assert.match(result.status === "stopped" ? result.message : "", /send a new request to retry/);
+    assert.match(result.status === "stopped" ? result.message : "", /Send a new request to retry/);
     assert.doesNotMatch(JSON.stringify(result), /eligible at|hours|retryAt/);
   }));
 
@@ -221,6 +221,204 @@ test("a verified replacement revision can initiate a later recovery round", asyn
     assert.equal(probes, 2);
   }));
 
+test("real quota failures resume the same sweep and concurrent continuations share the remaining candidates", async () =>
+  fixture(async (h) => {
+    const attempted: string[] = [];
+    const signal = new AbortController().signal;
+    const probe = async (name: string) => {
+      attempted.push(name);
+      return "pong" as const;
+    };
+    const first = await h.createRecovery().recover(h.failed, probe, signal);
+    assert.equal(first.status, "ready");
+    if (first.status !== "ready") return;
+    assert.equal(first.round, h.failed.revision);
+    const replacement = await h.selection.ensure();
+    const started = deferred<void>();
+    const release = deferred<"pong">();
+    const nextProbe = async (name: string) => {
+      attempted.push(name);
+      started.resolve();
+      return release.promise;
+    };
+    const leader = h.createRecovery().recover(replacement, nextProbe, signal, undefined, first.round);
+    await started.promise;
+    const waiter = h.createRecovery().recover(replacement, nextProbe, signal, undefined, first.round);
+    const fresh = h.createRecovery().recover(replacement, nextProbe, signal);
+    release.resolve("pong");
+    const [second, shared, joined] = await Promise.all([leader, waiter, fresh]);
+    assert.equal(second.status, "ready");
+    assert.deepEqual(shared, second);
+    assert.deepEqual(joined, second);
+    if (second.status !== "ready") return;
+    assert.equal(second.round, first.round);
+    const stopped = await h
+      .createRecovery()
+      .recover(await h.selection.ensure(), probe, signal, undefined, second.round);
+    assert.equal(stopped.status, "stopped");
+    assert.deepEqual(attempted, ["first", "second"]);
+    assert.deepEqual(
+      await h.createRecovery().recover(await h.selection.ensure(), probe, signal, undefined, second.round),
+      stopped,
+    );
+    assert.deepEqual(attempted, ["first", "second"]);
+  }));
+
+test("a delayed waiter follows the same sweep across verified replacements", async () =>
+  fixture(async (h) => {
+    const signal = new AbortController().signal;
+    const started = deferred<void>();
+    const release = deferred<"pong">();
+    const attempted: string[] = [];
+    const leader = h.createRecovery().recover(
+      h.failed,
+      async (name) => {
+        attempted.push(name);
+        started.resolve();
+        return release.promise;
+      },
+      signal,
+    );
+    await started.promise;
+    const waiterStarted = deferred<void>();
+    const releaseWaiter = deferred<void>();
+    const backend = new FileAccountStorageBackend(h.recoveryFile);
+    const read = backend.readAsync.bind(backend);
+    backend.readAsync = async (reader, operation) => {
+      waiterStarted.resolve();
+      await releaseWaiter.promise;
+      return read(reader, operation);
+    };
+    const waiter = new QuotaRecovery(h.store, h.selection, backend).recover(
+      h.failed,
+      async () => {
+        throw new Error("Waiters must not probe");
+      },
+      signal,
+    );
+    await waiterStarted.promise;
+    release.resolve("pong");
+    const first = await leader;
+    assert.equal(first.status, "ready");
+    if (first.status !== "ready") return;
+    const second = await h.createRecovery().recover(
+      await h.selection.ensure(),
+      async (name) => {
+        attempted.push(name);
+        return "pong";
+      },
+      signal,
+      undefined,
+      first.round,
+    );
+    assert.equal(second.status, "ready");
+    releaseWaiter.resolve();
+    assert.deepEqual(await waiter, second);
+    assert.deepEqual(attempted, ["first", "second"]);
+  }));
+
+test("a competing fresh sweep supersedes an older continuation without borrowing its candidates", async () =>
+  fixture(async (h) => {
+    const signal = new AbortController().signal;
+    const ready = await h.createRecovery().recover(h.failed, async () => "pong", signal);
+    assert.equal(ready.status, "ready");
+    if (ready.status !== "ready") return;
+    const replacement = await h.selection.ensure();
+    const started = deferred<void>();
+    const release = deferred<"pong">();
+    const fresh = h.createRecovery().recover(
+      replacement,
+      async (name) => {
+        assert.equal(name, "failed");
+        started.resolve();
+        return release.promise;
+      },
+      signal,
+    );
+    await started.promise;
+    const superseded = await h.createRecovery().recover(
+      replacement,
+      async () => {
+        throw new Error("A competing continuation must not probe");
+      },
+      signal,
+      undefined,
+      ready.round,
+    );
+    assert.equal(superseded.status, "stopped");
+    release.resolve("pong");
+    const result = await fresh;
+    assert.equal(result.status, "ready");
+    if (result.status === "ready") assert.equal(result.round, replacement.revision);
+  }));
+
+test("quota probes consume candidates too and accounts added mid-sweep do not extend it", async () =>
+  fixture(async (h) => {
+    const attempted: string[] = [];
+    const signal = new AbortController().signal;
+    const probe = async (name: string) => {
+      attempted.push(name);
+      return name === "first" ? ("quota" as const) : ("pong" as const);
+    };
+    const ready = await h.createRecovery().recover(h.failed, probe, signal);
+    assert.equal(ready.status, "ready");
+    if (ready.status !== "ready") return;
+    await h.store.updateProvider("openai", (state) => ({
+      ...state,
+      accounts: { ...state.accounts, later: credential("later") },
+    }));
+    const stopped = await h.createRecovery().recover(await h.selection.ensure(), probe, signal, undefined, ready.round);
+    assert.equal(stopped.status, "stopped");
+    assert.deepEqual(attempted, ["first", "second"]);
+    // A separate request has no exclusion inherited from the completed sweep.
+    const fresh = await h.createRecovery().recover(await h.selection.ensure(), probe, signal);
+    assert.equal(fresh.status, "ready");
+    assert.deepEqual(attempted, ["first", "second", "failed"]);
+  }));
+
+test("removed remaining candidates are skipped without repeating earlier probes", async () =>
+  fixture(async (h) => {
+    const signal = new AbortController().signal;
+    const attempted: string[] = [];
+    const probe = async (name: string) => {
+      attempted.push(name);
+      return "pong" as const;
+    };
+    const ready = await h.createRecovery().recover(h.failed, probe, signal);
+    assert.equal(ready.status, "ready");
+    if (ready.status !== "ready") return;
+    await h.store.updateProvider("openai", (state) => {
+      delete state.accounts.second;
+      return state;
+    });
+    assert.equal(
+      (await h.createRecovery().recover(await h.selection.ensure(), probe, signal, undefined, ready.round)).status,
+      "stopped",
+    );
+    assert.deepEqual(attempted, ["first"]);
+  }));
+
+test("a manual selection invalidates a continuation instead of starting another sweep", async () =>
+  fixture(async (h) => {
+    const signal = new AbortController().signal;
+    const ready = await h.createRecovery().recover(h.failed, async () => "pong", signal);
+    assert.equal(ready.status, "ready");
+    if (ready.status !== "ready") return;
+    const manual = await h.selection.select("second");
+    assert.ok(manual);
+    const stopped = await h.createRecovery().recover(
+      manual,
+      async () => {
+        throw new Error("A superseded sweep must not probe");
+      },
+      signal,
+      undefined,
+      ready.round,
+    );
+    assert.equal(stopped.status, "stopped");
+    assert.deepEqual(await h.selection.ensure(), manual);
+  }));
+
 test("a replaced credential prevents publication of a stale successful probe", async () =>
   fixture(async (h) => {
     const started = deferred<string>();
@@ -338,11 +536,13 @@ test("old stopped records do not impose a waiting period and unknown recovery fi
     await writeFile(
       h.recoveryFile,
       JSON.stringify({
-        version: 1,
+        version: 2,
         future: { keep: true },
         rounds: {
           [h.failed.revision]: {
             owner: "old-runtime",
+            revision: h.failed.revision,
+            remaining: [],
             startedAt: Date.now(),
             deadline: Date.now(),
             result: { status: "stopped", message: "Old five-hour result" },
@@ -358,7 +558,22 @@ test("old stopped records do not impose a waiting period and unknown recovery fi
     assert.deepEqual(JSON.parse(await readFile(h.recoveryFile, "utf8")).future, { keep: true });
   }));
 
-test.each(["{", "[]", '{"version":2,"rounds":{}}', '{"version":1,"rounds":{"invalid":1}}'])(
+test("obsolete recovery state is discarded without inheriting an earlier sweep or cooldown", async () =>
+  fixture(async (h) => {
+    await writeFile(
+      h.recoveryFile,
+      JSON.stringify({
+        version: 1,
+        rounds: { [h.failed.revision]: { result: { status: "stopped", message: "obsolete" } } },
+      }),
+    );
+    const recovery = h.createRecovery();
+    assert.equal(await recovery.retryToken(h.failed), undefined);
+    assert.equal((await recovery.recover(h.failed, async () => "pong", new AbortController().signal)).status, "ready");
+    assert.equal(JSON.parse(await readFile(h.recoveryFile, "utf8")).version, 2);
+  }));
+
+test.each(["{", "[]", '{"version":3,"rounds":{}}', '{"version":2,"rounds":{"invalid":1}}'])(
   "invalid recovery files are not overwritten: %s",
   async (raw) =>
     fixture(async (h) => {

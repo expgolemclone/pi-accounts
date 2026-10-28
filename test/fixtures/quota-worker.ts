@@ -12,6 +12,7 @@ type Start = {
   hold: boolean;
   quota: boolean;
   retryToken?: string;
+  continuation?: string;
 };
 process.once("message", async (input: Start) => {
   const store = new AccountStore(new FileAccountStorageBackend(join(input.directory, "accounts.json")));
@@ -32,6 +33,7 @@ process.once("message", async (input: Start) => {
       },
       AbortSignal.timeout(10_000),
       input.retryToken,
+      input.continuation,
     );
     process.send?.({ kind: "result", result }, () => process.disconnect?.());
   } catch {

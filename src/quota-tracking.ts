@@ -21,7 +21,9 @@ export class QuotaTracker {
       model: Model<Api>,
       signal: AbortSignal,
       retryToken?: string,
+      round?: string,
     ) => Promise<void>,
+    private readonly succeeded: (ctx: ExtensionContext, round: string | undefined) => void,
   ) {}
 
   wrap(
@@ -32,6 +34,7 @@ export class QuotaTracker {
     selection: SharedSelection,
     isOperationCurrent: () => boolean,
     retryToken?: string,
+    round?: string,
   ): StreamWrapper | undefined {
     if (credential.type !== "oauth") return undefined;
     const access = credential.access;
@@ -57,7 +60,7 @@ export class QuotaTracker {
           try {
             const state = await this.store.readProviderAsync("openai", signal);
             if (credentialGeneration(getOwnCredential(state.accounts, name)) === generation && isOperationCurrent()) {
-              await this.limited(ctx, selection, model, signal, retryToken);
+              await this.limited(ctx, selection, model, signal, retryToken, round);
             }
           } catch {
             if (!signal.aborted) {
@@ -69,8 +72,10 @@ export class QuotaTracker {
             }
           }
         };
+        const succeeded = this.succeeded;
         return (async function* () {
           for await (const event of source) {
+            if (event.type === "done" && !signal.aborted && isOperationCurrent()) succeeded(ctx, round);
             if (
               event.type === "error" &&
               event.error.stopReason === "error" &&

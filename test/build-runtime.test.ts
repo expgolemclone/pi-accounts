@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { afterAll, beforeAll, describe, test } from "vitest";
 import { isolateAccountEnvironment } from "./isolate-account-environment.js";
 
 interface BuildMetadata {
@@ -261,23 +261,36 @@ async function listFiles(directory: string, prefix = ""): Promise<string[]> {
   return files.sort();
 }
 
-test("generated runtime is loadable by Pi's Jiti resource loader", async () => {
-  const builder = await loadBuilder();
-  const root = await mkdtemp(join(packageRoot, ".pi-accounts-build-test-"));
-  const agentDir = join(root, "agent");
-  const output = join(root, "dist");
+describe("generated runtime", () => {
+  let root: string | undefined;
+  let agentDir: string;
+  let loader: DefaultResourceLoader;
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  try {
+
+  beforeAll(async () => {
+    const builder = await loadBuilder();
+    root = await mkdtemp(join(packageRoot, ".pi-accounts-build-test-"));
+    agentDir = join(root, "agent");
+    const output = join(root, "dist");
     await builder.buildRuntime({ outputDirectory: output });
     await mkdir(agentDir, { recursive: true });
     process.env.PI_CODING_AGENT_DIR = agentDir;
-    const loader = new DefaultResourceLoader({
+    loader = new DefaultResourceLoader({
       cwd: root,
       agentDir,
       settingsManager: SettingsManager.inMemory({}),
       additionalExtensionPaths: [join(output, "index.ts")],
     });
     await loader.reload();
+  });
+
+  afterAll(async () => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (root) await rm(root, { force: true, recursive: true });
+  });
+
+  test("is loadable by Pi's Jiti resource loader and handles account commands", async () => {
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []);
     assert.equal(loaded.extensions.length, 1);
@@ -355,9 +368,5 @@ test("generated runtime is loadable by Pi's Jiti resource loader", async () => {
     assert.equal(choices.length, 0);
     assert.equal(JSON.parse(await readFile(accountsFile, "utf8")).providers["openai-codex"].active, "work");
     assert.match(notifications.at(-1) ?? "", /new sessions: work.*unchanged/u);
-  } finally {
-    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-    await rm(root, { force: true, recursive: true });
-  }
+  });
 });

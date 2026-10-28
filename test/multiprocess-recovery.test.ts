@@ -9,7 +9,7 @@ import { build } from "esbuild";
 import { afterEach, beforeEach, test } from "vitest";
 import { AccountStore } from "../src/account-store.js";
 import { QuotaRecovery, type RecoveryResult } from "../src/quota-recovery.js";
-import { OpenAISelection } from "../src/shared-selection.js";
+import { OpenAISelection, type SharedSelection } from "../src/shared-selection.js";
 import { FileAccountStorageBackend } from "../src/storage.js";
 
 async function fixture() {
@@ -53,7 +53,14 @@ async function fixture() {
     ready: Promise<void>;
     probe: Promise<void>;
     result: Promise<RecoveryResult>;
-    run: (options?: { hold?: boolean; timeoutMs?: number; quota?: boolean; retryToken?: string }) => boolean;
+    run: (options?: {
+      hold?: boolean;
+      timeoutMs?: number;
+      quota?: boolean;
+      retryToken?: string;
+      failed?: SharedSelection;
+      continuation?: string;
+    }) => boolean;
   };
   const children: Actor[] = [];
   function start(): Actor {
@@ -94,13 +101,14 @@ async function fixture() {
       ready,
       probe,
       result,
-      run: ({ hold = false, timeoutMs = 5_000, quota = false, retryToken }: Parameters<Actor["run"]>[0] = {}) =>
-        child.send({ directory, failed, timeoutMs, hold, quota, retryToken }),
+      run: (options: Parameters<Actor["run"]>[0] = {}) =>
+        child.send({ directory, failed, timeoutMs: 5_000, hold: false, quota: false, ...options }),
     };
     children.push(instance);
     return instance;
   }
   return {
+    store,
     selection,
     retryToken: () =>
       new QuotaRecovery(store, selection, new FileAccountStorageBackend(join(directory, "recovery.json"))).retryToken(
@@ -160,6 +168,44 @@ test("new requests in independent processes elect just one fresh representative 
   assert.equal(h.probes(), 2);
   assert.equal((await h.selection.ensure()).account, "b");
   await Promise.all([first, ...actors].map((actor) => actor.closed));
+});
+
+test("independent processes resume one sweep without revisiting earlier candidates", async () => {
+  await h.store.updateProvider("openai", (state) => ({
+    ...state,
+    accounts: {
+      ...state.accounts,
+      c: {
+        type: "oauth",
+        access: "synthetic-c",
+        refresh: "refresh-c",
+        expires: Date.now() + 3_600_000,
+        piAccountsGeneration: "c",
+      },
+    },
+  }));
+  const first = h.actors[0];
+  const leader = h.actors[1];
+  const waiter = h.actors[2];
+  const late = h.actors[3];
+  assert.ok(first && leader && waiter && late);
+  first.run();
+  const ready = await first.result;
+  assert.equal(ready.status, "ready");
+  if (ready.status !== "ready") return;
+  const failed = await h.selection.ensure();
+  assert.equal(failed.account, "b");
+  leader.run({ failed, continuation: ready.round });
+  await leader.probe;
+  waiter.run({ failed, continuation: ready.round });
+  const [result, shared] = await Promise.all([leader.result, waiter.result]);
+  assert.equal(result.status, "ready");
+  assert.deepEqual(shared, result);
+  assert.equal((await h.selection.ensure()).account, "c");
+  assert.equal(h.probes(), 2);
+  late.run({ failed, continuation: ready.round });
+  assert.deepEqual(await late.result, result);
+  assert.equal(h.probes(), 2);
 });
 
 test("a dead representative stops waiters at its deadline without another probe", async () => {

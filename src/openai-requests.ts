@@ -15,7 +15,7 @@ type SessionRequests = {
   inputRevision: number;
   sent?: string;
   compactionFailed?: boolean;
-  recoveryUsed?: boolean;
+  sweep?: string;
 };
 
 /** Request-local dispatch; never recursively calls modelRegistry.stream or mutates a stream already sent. */
@@ -36,8 +36,14 @@ export class OpenAIRequests {
       return probeAccount(...args);
     },
   ) {
-    this.tracker = new QuotaTracker(store, (ctx, selection, model, signal, retryToken) =>
-      this.recover(ctx, selection, model, signal, retryToken),
+    this.tracker = new QuotaTracker(
+      store,
+      (ctx, selection, model, signal, retryToken, round) =>
+        this.recover(ctx, selection, model, signal, retryToken, round),
+      (ctx, round) => {
+        const session = this.sessions.get(ctx.sessionManager);
+        if (session && session.sweep === round) session.sweep = undefined;
+      },
     );
   }
 
@@ -47,6 +53,7 @@ export class OpenAIRequests {
     model: Model<Api>,
     signal: AbortSignal,
     retryToken?: string,
+    round?: string,
   ): Promise<void> {
     const session = this.session(ctx);
     if (session.pending?.revision === selection.revision) {
@@ -54,19 +61,12 @@ export class OpenAIRequests {
       return;
     }
     if (session.pending && selection.revision !== this.snapshot()?.revision) return;
-    // A verified candidate can still reject the real conversation. Do not turn
-    // automatic continue into another recovery round or cycle through accounts.
-    if (!ctx.isIdle() && session.recoveryUsed) return;
-    if (!ctx.isIdle()) session.recoveryUsed = true;
     session.pending?.controller.abort();
     const controller = new AbortController();
     const operation = AbortSignal.any([signal, controller.signal]);
     const pending: Pending = { revision: selection.revision, controller };
     if (!ctx.isIdle()) session.pending = pending;
-    ctx.ui.notify(
-      "OpenAI usage limit reached; checking replacement accounts with one shared recovery round.",
-      "warning",
-    );
+    ctx.ui.notify("OpenAI usage limit reached; trying the remaining accounts in this recovery round.", "warning");
     // Await while the request's operation signal is still active. Escape cancels
     // the child here; there must be no asynchronous waiting at the final boundary.
     pending.completion = this.recovery
@@ -76,9 +76,13 @@ export class OpenAIRequests {
           this.probe(this.store, this.adapter, ctx, model, name, credential, probeSignal),
         operation,
         retryToken,
+        round,
       )
       .then((outcome) => {
         pending.outcome = outcome;
+        if (outcome.status === "ready" && session.pending === pending && !operation.aborted && this.current(ctx)) {
+          session.sweep = outcome.round;
+        }
       });
     await pending.completion;
   }
@@ -92,13 +96,13 @@ export class OpenAIRequests {
     return session;
   }
 
-  cancel(ctx: ExtensionContext, resetRecovery = false): void {
+  cancel(ctx: ExtensionContext, resetSweep = false): void {
     const session = this.sessions.get(ctx.sessionManager);
     session?.pending?.controller.abort();
     if (session) {
       session.pending = undefined;
       session.compactionFailed = false;
-      if (resetRecovery) session.recoveryUsed = false;
+      if (resetSweep) session.sweep = undefined;
       session.inputRevision++;
     }
   }
@@ -156,7 +160,8 @@ export class OpenAIRequests {
         const account = ready.selection.account;
         const credential = ready.credential;
         if (account !== null && credential?.type === "oauth") {
-          const retryToken = await this.recovery.retryToken(ready.selection, signal);
+          const round = session.sweep;
+          const retryToken = round === undefined ? await this.recovery.retryToken(ready.selection, signal) : undefined;
           signal.throwIfAborted();
           if (!this.current(ctx)) throw new Error("Accounts session was replaced before the request.");
           const tracked = this.tracker.wrap(
@@ -167,6 +172,7 @@ export class OpenAIRequests {
             ready.selection,
             () => this.current(ctx) && session.inputRevision === inputRevision,
             retryToken,
+            round,
           );
           return tracked ? tracked(stream)(model, context, next) : stream(model, context, next);
         }
@@ -178,6 +184,10 @@ export class OpenAIRequests {
   registerLifecycle(): void {
     this.pi.on("input", (_event, ctx) => {
       this.cancel(ctx, true);
+    });
+    this.pi.on("agent_settled", (_event, ctx) => {
+      const session = this.sessions.get(ctx.sessionManager);
+      if (session) session.sweep = undefined;
     });
     this.pi.on("session_compact_failed", (event, ctx) => {
       const session = this.sessions.get(ctx.sessionManager);

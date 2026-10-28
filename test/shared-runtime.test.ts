@@ -17,6 +17,7 @@ import { AccountStore } from "../src/account-store.js";
 import accountsExtension, { type AccountsDependencies } from "../src/accounts.js";
 import type { AccountProviderAdapter } from "../src/oauth.js";
 import { OPENAI_QUOTA_MESSAGE } from "../src/quota-errors.js";
+import { QuotaRecovery } from "../src/quota-recovery.js";
 import { OpenAISelection } from "../src/shared-selection.js";
 import { FileAccountStorageBackend } from "../src/storage.js";
 import { isolateAccountEnvironment } from "./isolate-account-environment.js";
@@ -35,9 +36,26 @@ function completed(text: string) {
     { type: "response.output_item.done", output_index: 0, item },
     { type: "response.completed", response: { id: "offline-response", status: "completed", output: [item] } },
   ];
+  return streamed(events);
+}
+function streamed(events: Array<{ type: string; [key: string]: unknown }>) {
   return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
     headers: { "content-type": "text/event-stream" },
   });
+}
+function toolCall() {
+  const item = {
+    type: "function_call",
+    id: "fc-offline",
+    call_id: "call-offline",
+    name: "switch_fixture",
+    arguments: "{}",
+    status: "completed",
+  };
+  return streamed([
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { status: "completed", output: [item] } },
+  ]);
 }
 const provider: AccountProviderAdapter = {
   id: "openai",
@@ -63,6 +81,7 @@ async function fixture(
   fetch: typeof globalThis.fetch,
   probe: AccountsDependencies["probe"],
   extra?: (pi: ExtensionAPI, selection: OpenAISelection) => void,
+  names: readonly string[] = ["a", "b"],
 ) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fetch;
@@ -72,7 +91,7 @@ async function fixture(
   await store.updateProvider("openai", () => ({
     active: "a",
     accounts: Object.fromEntries(
-      ["a", "b"].map((name) => [
+      names.map((name) => [
         name,
         {
           type: "oauth",
@@ -249,21 +268,7 @@ test("tool continuation adopts a shared manual switch and preserves the complete
       keys.push(request.headers.get("authorization") ?? "");
       inputs.push(await request.text());
       if (keys.length > 1) return completed("tool result preserved");
-      const item = {
-        type: "function_call",
-        id: "fc-offline",
-        call_id: "call-offline",
-        name: "switch_fixture",
-        arguments: "{}",
-        status: "completed",
-      };
-      const events = [
-        { type: "response.output_item.done", output_index: 0, item },
-        { type: "response.completed", response: { status: "completed", output: [item] } },
-      ];
-      return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
-        headers: { "content-type": "text/event-stream" },
-      });
+      return toolCall();
     },
     async () => {
       throw new Error("No quota expected");
@@ -309,39 +314,50 @@ test("native manual compaction reconciles the shared identity without reload", a
   });
 });
 
-test("quota during overflow compaction recovers once without recording a false successful compaction", async () => {
-  const keys: string[] = [];
-  let probes = 0;
-  const h = await fixture(
-    async (input, init) => {
-      keys.push(new Request(input, init).headers.get("authorization") ?? "");
-      if (keys.length === 2)
-        return new Response(JSON.stringify({ error: { message: "maximum context length exceeded" } }), { status: 400 });
-      if (keys.length === 3)
-        return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
-      return completed("finished");
-    },
-    async () => {
-      probes++;
-      return "pong";
-    },
-  );
-  await use(h, async ({ session, manager }) => {
-    await session.prompt("seed context");
-    session.setAutoCompactionEnabled(true);
-    await session.prompt("trigger offline overflow");
-    assert.equal(probes, 1);
-    assert.deepEqual(keys, ["Bearer offline-a", "Bearer offline-a", "Bearer offline-a", "Bearer offline-b"]);
-    assert.equal(manager.getEntries().filter((entry) => entry.type === "compaction").length, 0);
-    assert.equal(
-      manager
-        .getEntries()
-        .filter((entry) => entry.type === "custom_message" && entry.customType === "accounts:quota-continue").length,
-      1,
+test.each([{ names: ["a", "b"] }, { names: ["a", "b", "c"] }])(
+  "quota during overflow compaction uses one sweep without a false successful compaction: $names",
+  async ({ names }) => {
+    const keys: string[] = [];
+    let probes = 0;
+    const h = await fixture(
+      async (input, init) => {
+        keys.push(new Request(input, init).headers.get("authorization") ?? "");
+        if (keys.length === 2)
+          return new Response(JSON.stringify({ error: { message: "maximum context length exceeded" } }), {
+            status: 400,
+          });
+        if (keys.length >= 3 && keys.at(-1) !== `Bearer offline-${names.at(-1)}`)
+          return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+        return completed("finished");
+      },
+      async () => {
+        probes++;
+        return "pong";
+      },
+      undefined,
+      names,
     );
-    assert.equal(session.getLastAssistantText(), "finished");
-  });
-});
+    await use(h, async ({ session, manager }) => {
+      await session.prompt("seed context");
+      session.setAutoCompactionEnabled(true);
+      await session.prompt("trigger offline overflow");
+      assert.equal(probes, names.length - 1);
+      assert.deepEqual(keys, [
+        "Bearer offline-a",
+        "Bearer offline-a",
+        ...names.map((name) => `Bearer offline-${name}`),
+      ]);
+      assert.equal(manager.getEntries().filter((entry) => entry.type === "compaction").length, 0);
+      assert.equal(
+        manager
+          .getEntries()
+          .filter((entry) => entry.type === "custom_message" && entry.customType === "accounts:quota-continue").length,
+        names.length - 1,
+      );
+      assert.equal(session.getLastAssistantText(), "finished");
+    });
+  },
+);
 
 test("new user work cancels pending verification and cannot inherit an automatic continue", async () => {
   let entered!: () => void;
@@ -583,7 +599,187 @@ test("new input retries a stopped recovery immediately without reload or account
   });
 });
 
-test("a successful probe followed by a quota-limited real continuation cannot loop; new input resets the budget", async () => {
+test.each([
+  {
+    name: "all real requests limited",
+    available: undefined,
+    limitedProbe: undefined,
+    requests: ["a", "b", "c"],
+    continues: 2,
+  },
+  {
+    name: "last real request succeeds",
+    available: "c",
+    limitedProbe: undefined,
+    requests: ["a", "b", "c"],
+    continues: 2,
+  },
+  { name: "limited probe is consumed", available: "c", limitedProbe: "b", requests: ["a", "c"], continues: 1 },
+])("one three-account sweep: $name", async ({ available, limitedProbe, requests: expected, continues }) => {
+  const requests: string[] = [];
+  const probes: string[] = [];
+  const h = await fixture(
+    async (input, init) => {
+      const name = new Request(input, init).headers.get("authorization")?.replace("Bearer offline-", "") ?? "";
+      requests.push(name);
+      if (name === available) return completed("recovered");
+      return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+    },
+    async (_store, _adapter, _ctx, _model, name) => {
+      probes.push(name);
+      return name === limitedProbe ? "quota" : "pong";
+    },
+    undefined,
+    ["a", "b", "c"],
+  );
+  await use(h, async ({ session, manager }) => {
+    await session.prompt("try every account once");
+    assert.deepEqual(requests, expected);
+    assert.deepEqual(probes, ["b", "c"]);
+    assert.equal(session.isIdle, true);
+    assert.equal(
+      manager
+        .getEntries()
+        .filter((entry) => entry.type === "custom_message" && entry.customType === "accounts:quota-continue").length,
+      continues,
+    );
+    if (available) {
+      assert.equal(session.getLastAssistantText(), "recovered");
+    } else {
+      await session.prompt("explicit new sweep");
+      assert.deepEqual(requests, ["a", "b", "c", "c", "a", "b"]);
+      assert.deepEqual(probes, ["b", "c", "a", "b"]);
+    }
+  });
+});
+
+test.each([false, true])(
+  "a lagging session adopts the same sweep after another representative advances it; success=%s",
+  async (succeeds) => {
+    const requests: string[] = [];
+    const probes: string[] = [];
+    let advanced = false;
+    const h = await fixture(
+      async (input, init) => {
+        const name = new Request(input, init).headers.get("authorization")?.replace("Bearer offline-", "") ?? "";
+        requests.push(name);
+        if (succeeds && requests.length === 2) return toolCall();
+        if (succeeds && requests.length === 4) return completed("fresh sweep recovered");
+        return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+      },
+      async (_store, _adapter, _ctx, _model, name) => {
+        probes.push(name);
+        return "pong";
+      },
+      (pi) => {
+        pi.registerTool({
+          name: "switch_fixture",
+          label: "Fixture",
+          description: "Offline fixture",
+          parameters: { type: "object", properties: {} },
+          execute: async () => ({ content: [{ type: "text", text: "COMPLETED_TOOL_RESULT" }], details: {} }),
+        });
+        pi.on("agent_before_settle", async (event, ctx) => {
+          const entry = event.entries.find(
+            (item) => item.type === "custom_message" && item.customType === "accounts:quota-continue",
+          );
+          if (advanced || entry?.type !== "custom_message") return;
+          advanced = true;
+          const { failedRevision } = entry.details as { failedRevision: string };
+          // Another process exhausts B while this session is about to continue on it.
+          const recovery = new QuotaRecovery(
+            h.store,
+            h.selection,
+            new FileAccountStorageBackend(join(h.directory, "recovery.json")),
+          );
+          const ready = await recovery.recover(
+            await h.selection.ensure(),
+            async (name) => {
+              probes.push(name);
+              return "pong";
+            },
+            ctx.signal ?? new AbortController().signal,
+            undefined,
+            failedRevision,
+          );
+          assert.equal(ready.status, "ready");
+        });
+      },
+      ["a", "b", "c"],
+    );
+    await use(h, async ({ session }) => {
+      await session.prompt("adopt the shared continuation without restarting the sweep");
+      assert.deepEqual(requests, succeeds ? ["a", "c", "c", "a"] : ["a", "c"]);
+      assert.deepEqual(probes, succeeds ? ["b", "c", "a"] : ["b", "c"]);
+      assert.equal(session.isIdle, true);
+      if (succeeds) assert.equal(session.getLastAssistantText(), "fresh sweep recovered");
+    });
+  },
+);
+
+test("a successful real tool response ends the sweep before another quota in the same user run", async () => {
+  const requests: string[] = [];
+  const inputs: string[] = [];
+  const probes: string[] = [];
+  const h = await fixture(
+    async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(request.headers.get("authorization") ?? "");
+      inputs.push(await request.text());
+      if (requests.length === 2) return toolCall();
+      if (requests.length === 4) return completed("second sweep recovered");
+      return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+    },
+    async (_store, _adapter, _ctx, _model, name) => {
+      probes.push(name);
+      return "pong";
+    },
+    (pi) => {
+      pi.registerTool({
+        name: "switch_fixture",
+        label: "Fixture",
+        description: "Offline fixture",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({ content: [{ type: "text", text: "COMPLETED_TOOL_RESULT" }], details: {} }),
+      });
+    },
+    ["a", "b", "c"],
+  );
+  await use(h, async ({ session }) => {
+    await session.prompt("finish both recoveries");
+    assert.deepEqual(requests, ["Bearer offline-a", "Bearer offline-b", "Bearer offline-b", "Bearer offline-a"]);
+    assert.deepEqual(probes, ["b", "a"]);
+    assert.match(inputs[3] ?? "", /COMPLETED_TOOL_RESULT/);
+    assert.equal(session.getLastAssistantText(), "second sweep recovered");
+  });
+});
+
+test("an account used earlier in the session remains eligible for a later quota sweep", async () => {
+  const requests: string[] = [];
+  const probes: string[] = [];
+  const h = await fixture(
+    async (input, init) => {
+      const key = new Request(input, init).headers.get("authorization") ?? "";
+      requests.push(key);
+      if (key === "Bearer offline-a") return completed("available");
+      return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+    },
+    async (_store, _adapter, _ctx, _model, name) => {
+      probes.push(name);
+      return "pong";
+    },
+  );
+  await use(h, async ({ session, selection }) => {
+    await session.prompt("use a normally");
+    await selection.select("b");
+    await session.prompt("a is still eligible");
+    assert.deepEqual(requests, ["Bearer offline-a", "Bearer offline-b", "Bearer offline-a"]);
+    assert.deepEqual(probes, ["a"]);
+    assert.equal(session.getLastAssistantText(), "available");
+  });
+});
+
+test("a successful probe followed by real quota consumes the last account; new input starts a fresh sweep", async () => {
   let probes = 0;
   let requests = 0;
   const h = await fixture(
@@ -611,6 +807,85 @@ test("a successful probe followed by a quota-limited real continuation cannot lo
         .filter((entry) => entry.type === "custom_message" && entry.customType === "accounts:quota-continue").length,
       2,
     );
+  });
+});
+
+test("Escape during a later candidate stops the sweep and new input can reuse earlier accounts", async () => {
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const requests: string[] = [];
+  const probes: string[] = [];
+  let retrying = false;
+  const h = await fixture(
+    async (input, init) => {
+      const name = new Request(input, init).headers.get("authorization")?.replace("Bearer offline-", "") ?? "";
+      requests.push(name);
+      if (retrying && name === "a") return completed("recovered after cancellation");
+      return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+    },
+    async (_store, _adapter, _ctx, _model, name, _credential, signal) => {
+      probes.push(name);
+      if (!retrying && name === "c") {
+        entered();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+      return "pong";
+    },
+    undefined,
+    ["a", "b", "c"],
+  );
+  await use(h, async ({ session, selection }) => {
+    const run = session.prompt("cancel the second candidate");
+    await started;
+    await session.abort();
+    await run;
+    assert.deepEqual(requests, ["a", "b"]);
+    assert.deepEqual(probes, ["b", "c"]);
+    assert.equal((await selection.ensure()).account, "b");
+    retrying = true;
+    await session.prompt("start a new sweep");
+    assert.deepEqual(requests, ["a", "b", "b", "a"]);
+    assert.deepEqual(probes, ["b", "c", "a"]);
+    assert.equal(session.getLastAssistantText(), "recovered after cancellation");
+  });
+});
+
+test("a settled non-quota failure discards the sweep before an independent idle request", async () => {
+  const requests: string[] = [];
+  const probes: string[] = [];
+  let nextRequest = false;
+  const h = await fixture(
+    async (input, init) => {
+      const name = new Request(input, init).headers.get("authorization")?.replace("Bearer offline-", "") ?? "";
+      requests.push(name);
+      if (name === "a" || nextRequest)
+        return new Response(JSON.stringify({ error: { message: OPENAI_QUOTA_MESSAGE } }), { status: 429 });
+      return new Response(JSON.stringify({ error: { message: "server unavailable" } }), { status: 503 });
+    },
+    async (_store, _adapter, _ctx, _model, name) => {
+      probes.push(name);
+      return "pong";
+    },
+    undefined,
+    ["a", "b", "c"],
+  );
+  await use(h, async ({ session, runtime, selection }) => {
+    await session.prompt("quota then unrelated native failure");
+    assert.deepEqual(requests, ["a", "b", "b", "b"]);
+    assert.deepEqual(probes, ["b"]);
+    assert.equal(session.isIdle, true);
+    nextRequest = true;
+    const model = runtime.getModel("openai", "gpt-4o");
+    assert.ok(model);
+    const result = await runtime.completeSimple(model, {
+      messages: [{ role: "user", content: "independent idle request", timestamp: 0 }],
+    });
+    assert.equal(result.stopReason, "error");
+    assert.deepEqual(probes, ["b", "a"]);
+    assert.equal((await selection.ensure()).account, "a");
+    assert.equal(session.isIdle, true);
   });
 });
 
